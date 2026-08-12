@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>Vela</string>
+	<key>CFBundleExecutable</key>
+	<string>Vela</string>
+	<key>CFBundleIconFile</key>
+	<string>Vela.icns</string>
+	<key>CFBundleIdentifier</key>
+	<string>@VELA_BUNDLE_ID@</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>Vela</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>@VELA_VERSION@</string>
+	<key>CFBundleVersion</key>
+	<string>@VELA_VERSION@</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>12.0</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Vela uses local network connections for user-authorized music services and device workflows.</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Vela needs removable-volume access to browse and synchronize user-selected iPod devices.</string>
+	<key>VelaBuildMode</key>
+	<string>@VELA_BUILD_MODE@</string>
+</dict>
+</plist>

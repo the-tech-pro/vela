@@ -1,0 +1,59 @@
+From: Vela maintainers
+Date: 2026-08-12
+Subject: [PATCH] ipod6g: require byte-exact SysCfg NOR readback
+
+This patch applies after Olsro's SysCfg debug-menu patch at guide revision
+1f3d33805259c1c2b58a5076bb3580e86bacdaf1 on Rockbox commit
+2df1172e985c45e9bf7fe3283bbb42dfaa36c735.
+
+Reject an invalid entry count or header size before writing. After writing,
+compare every header and entry byte directly against NOR while the flash is
+open. A structurally readable SysCfg is not sufficient.
+
+This file is a modification of Rockbox and is distributed under
+GPL-2.0-or-later.
+---
+ firmware/target/arm/s5l8702/norboot-s5l8702.c | 23 ++++++++++++++++-------
+ 1 file changed, 16 insertions(+), 7 deletions(-)
+
+diff --git a/firmware/target/arm/s5l8702/norboot-s5l8702.c b/firmware/target/arm/s5l8702/norboot-s5l8702.c
+index 2a380bc8f5..61bffccb3a 100644
+--- a/firmware/target/arm/s5l8702/norboot-s5l8702.c
++++ b/firmware/target/arm/s5l8702/norboot-s5l8702.c
+@@ -238,18 +238,27 @@ bool syscfg_write(struct SysCfg* syscfg)
+ {
+     const size_t syscfg_hdr_size = sizeof(struct SysCfgHeader);
+     const size_t syscfg_entry_size = sizeof(struct SysCfgEntry);
+-    
++    const size_t syscfg_num_entries = syscfg->header.num_entries;
++    const size_t syscfg_entries_size = syscfg_entry_size * syscfg_num_entries;
++    const size_t calculated_syscfg_size = syscfg_hdr_size + syscfg_entries_size;
++
++    if (syscfg_num_entries > SYSCFG_MAX_ENTRIES ||
++        syscfg->header.size != calculated_syscfg_size)
++        return false;
++
+     bootflash_init(SPI_PORT);
+ 
+     bootflash_write(SPI_PORT, 0, &syscfg->header, syscfg_hdr_size);
+-    bootflash_write(SPI_PORT, syscfg_hdr_size, &syscfg->entries, syscfg_entry_size * syscfg->header.num_entries);
++    bootflash_write(SPI_PORT, syscfg_hdr_size, &syscfg->entries, syscfg_entries_size);
+ 
+-    bootflash_close(SPI_PORT);
++    const bool header_matches =
++        !(bootflash_compare(SPI_PORT, 0, &syscfg->header, syscfg_hdr_size) & 1);
++    const bool entries_match =
++        !(bootflash_compare(SPI_PORT, syscfg_hdr_size, &syscfg->entries,
++                            syscfg_entries_size) & 1);
+ 
+-    /* Now we must verify that we can read it */
+-    struct SysCfg syscfg_written;
+-    ssize_t result = syscfg_read(&syscfg_written);
+-    return (result == 0);
++    bootflash_close(SPI_PORT);
++    return header_matches && entries_matches;
+ }
+ 
+ /*
+-- 
+2.45.2

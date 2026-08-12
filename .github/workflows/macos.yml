@@ -1,0 +1,300 @@
+name: macOS native builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign_and_notarize:
+        description: Sign/notarize a v* tag through the protected release environment
+        required: true
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      sign_and_notarize:
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  release-contract:
+    name: Validate macOS release request
+    runs-on: ubuntu-latest
+    env:
+      REQUEST_SIGNING: ${{ inputs.sign_and_notarize }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require a version tag for protected packaging
+        shell: bash
+        run: |
+          if [[ "$REQUEST_SIGNING" == "true" && "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "Signing and notarization are allowed only for a v* tag." >&2
+            exit 1
+          fi
+          if [[ "$REQUEST_SIGNING" == "true" ]]; then
+            version="$(python -c 'from build_desktop import read_product_version; print(read_product_version())')"
+            if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+              echo "Release tag $GITHUB_REF_NAME does not match product version $version." >&2
+              exit 1
+            fi
+          fi
+
+  native-build:
+    name: macOS ${{ matrix.arch }}
+    needs: release-contract
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, amd64]
+    runs-on: [self-hosted, macOS, "${{ matrix.arch }}"]
+    env:
+      VELA_TARGET_ARCH: ${{ matrix.arch }}
+      VELA_TOOLS_DIR: /opt/vela-tools/${{ matrix.arch }}/bin
+      VELA_TOOLS_CHECKSUMS: /opt/vela-tools/${{ matrix.arch }}/SHA256SUMS
+      VELA_RELEASE_OWNER_METADATA: /opt/vela-tools/${{ matrix.arch }}/owner-metadata.json
+      VELA_BUNDLE_ID: ${{ vars.VELA_BUNDLE_ID }}
+      VELA_ICON_ICNS: ${{ vars.VELA_ICON_ICNS }}
+      MACOSX_DEPLOYMENT_TARGET: "12.0"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: antra-wails/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+          cache-dependency-path: antra-wails/frontend/package-lock.json
+
+      - name: Verify native runner and tool inputs
+        shell: bash
+        run: |
+          python - <<'PY'
+          import platform
+          expected = "${{ matrix.arch }}"
+          actual = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64"}.get(platform.machine().lower())
+          if actual != expected:
+              raise SystemExit(f"native runner mismatch: expected {expected}, got {actual}")
+          PY
+          test -f "$VELA_TOOLS_CHECKSUMS"
+          test -f "$VELA_RELEASE_OWNER_METADATA"
+          python packaging/release/release_metadata.py validate-owner \
+            --metadata "$VELA_RELEASE_OWNER_METADATA" \
+            --media-root "$VELA_TOOLS_DIR"
+          if [[ "${{ inputs.sign_and_notarize }}" == "true" ]]; then
+            test -n "$VELA_BUNDLE_ID"
+            test "$VELA_BUNDLE_ID" != "com.example.vela"
+            test -f "$VELA_ICON_ICNS"
+          fi
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install -r requirements-test.txt
+          go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          npm ci --prefix antra-wails/frontend
+
+      - name: Run release gates and tests
+        run: |
+          python packaging/ipod-unlock/verify_release_inputs.py
+          python -m pytest -q
+          (cd antra-wails && go test ./...)
+          npm run check --prefix antra-wails/frontend
+
+      - name: Build native app
+        shell: bash
+        run: |
+          mode=development
+          if [[ "${{ inputs.sign_and_notarize }}" == "true" ]]; then
+            mode=release
+          fi
+          python build_desktop.py \
+            --build-mode "$mode" \
+            --target-arch "${{ matrix.arch }}"
+
+      - name: Validate unsigned artifact
+        shell: bash
+        run: |
+          test -x antra-wails/build/bin/Vela.app/Contents/MacOS/Vela
+          test -x antra-wails/build/bin/Vela.app/Contents/Helpers/VelaBackend/VelaBackend
+          file antra-wails/build/bin/Vela.app/Contents/MacOS/Vela | grep -q "$(test '${{ matrix.arch }}' = arm64 && echo arm64 || echo x86_64)"
+          /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' antra-wails/build/bin/Vela.app/Contents/Info.plist | grep -q '^12.0$'
+
+      - name: Archive unsigned app
+        run: ditto -c -k --sequesterRsrc --keepParent antra-wails/build/bin/Vela.app "Vela-${{ matrix.arch }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vela-unsigned-macOS-${{ matrix.arch }}
+          path: Vela-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+  release-package:
+    name: Sign and notarize macOS ${{ matrix.arch }}
+    if: ${{ inputs.sign_and_notarize }}
+    needs: native-build
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, amd64]
+    runs-on: [self-hosted, macOS, "${{ matrix.arch }}"]
+    environment: macos-release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      VELA_TARGET_ARCH: ${{ matrix.arch }}
+      VELA_TOOLS_DIR: /opt/vela-tools/${{ matrix.arch }}/bin
+      VELA_RELEASE_OWNER_METADATA: /opt/vela-tools/${{ matrix.arch }}/owner-metadata.json
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Vela-unsigned-macOS-${{ matrix.arch }}
+          path: .release-input
+
+      - name: Restore unsigned app bundle
+        shell: bash
+        run: |
+          mkdir -p antra-wails/build/bin
+          ditto -x -k ".release-input/Vela-${{ matrix.arch }}.zip" antra-wails/build/bin
+          test -x antra-wails/build/bin/Vela.app/Contents/MacOS/Vela
+
+      - name: Sign, notarize and normalize DMG
+        shell: bash
+        env:
+          VELA_CODESIGN_IDENTITY: ${{ secrets.VELA_CODESIGN_IDENTITY }}
+          VELA_NOTARY_PROFILE: ${{ secrets.VELA_NOTARY_PROFILE }}
+          VELA_NOTARIZE: "1"
+        run: |
+          test -n "$VELA_CODESIGN_IDENTITY" || { echo "VELA_CODESIGN_IDENTITY is not configured in macos-release" >&2; exit 1; }
+          test -n "$VELA_NOTARY_PROFILE" || { echo "VELA_NOTARY_PROFILE is not configured in macos-release" >&2; exit 1; }
+          bash packaging/macos/sign-and-package.sh
+          mkdir -p dist/release
+          version="$(python -c 'from build_desktop import read_product_version; print(read_product_version())')"
+          cp "dist/macos/$version/${{ matrix.arch }}/Vela-$version-macOS-${{ matrix.arch }}.dmg" \
+            "dist/release/Vela-macOS-${{ matrix.arch }}.dmg"
+
+      - name: Generate packaged-app SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: antra-wails/build/bin/Vela.app
+          format: spdx-json
+          output-file: dist/release/Vela-macOS-${{ matrix.arch }}.syft.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Add final artifact and owner evidence to SBOM
+        shell: bash
+        run: |
+          test -f "$VELA_RELEASE_OWNER_METADATA"
+          python packaging/release/release_metadata.py augment \
+            --base-spdx "dist/release/Vela-macOS-${{ matrix.arch }}.syft.spdx.json" \
+            --artifact "dist/release/Vela-macOS-${{ matrix.arch }}.dmg" \
+            --owner-metadata "$VELA_RELEASE_OWNER_METADATA" \
+            --media-root "$VELA_TOOLS_DIR" \
+            --platform macos \
+            --architecture "${{ matrix.arch }}" \
+            --output "dist/release/Vela-macOS-${{ matrix.arch }}.spdx.json"
+          rm "dist/release/Vela-macOS-${{ matrix.arch }}.syft.spdx.json"
+
+      - name: Generate build provenance
+        id: provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/release/Vela-macOS-${{ matrix.arch }}.dmg
+
+      - name: Stage provenance bundle
+        shell: bash
+        run: |
+          cp "${{ steps.provenance.outputs.bundle-path }}" \
+            "dist/release/Vela-macOS-${{ matrix.arch }}.provenance.json"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Vela-release-macOS-${{ matrix.arch }}
+          path: dist/release/*
+          if-no-files-found: error
+
+  macos-12-smoke:
+    name: macOS 12 smoke ${{ matrix.arch }}
+    if: ${{ inputs.sign_and_notarize }}
+    needs: release-package
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, amd64]
+    runs-on: [self-hosted, macOS, macOS-12, vela-smoke, "${{ matrix.arch }}"]
+    permissions:
+      contents: read
+    env:
+      VELA_MACOS12_SMOKE_HARNESS: ${{ vars.VELA_MACOS12_SMOKE_HARNESS }}
+      VELA_SMOKE_REQUIRE_IPOD: ${{ vars.VELA_SMOKE_REQUIRE_IPOD }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: Vela-release-macOS-${{ matrix.arch }}
+          path: .release-input
+
+      - name: Verify clean-install and runtime smoke contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(sw_vers -productVersion | cut -d. -f1)" = "12"
+          expected="$(test '${{ matrix.arch }}' = arm64 && echo arm64 || echo x86_64)"
+          test "$(uname -m)" = "$expected"
+
+          dmg="$PWD/.release-input/Vela-macOS-${{ matrix.arch }}.dmg"
+          mount_dir="$(mktemp -d)"
+          install_dir="$(mktemp -d)"
+          mounted=0
+          cleanup() {
+            if [[ "$mounted" == "1" ]]; then
+              hdiutil detach "$mount_dir" -force >/dev/null
+            fi
+            rm -rf "$mount_dir" "$install_dir"
+          }
+          trap cleanup EXIT
+
+          xcrun stapler validate "$dmg"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$dmg"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$mount_dir"
+          mounted=1
+          ditto "$mount_dir/Vela.app" "$install_dir/Vela.app"
+          xcrun stapler validate "$install_dir/Vela.app"
+          spctl --assess --type execute --verbose=2 "$install_dir/Vela.app"
+
+          bash packaging/macos/smoke-test.sh \
+            --app "$install_dir/Vela.app" \
+            --arch "${{ matrix.arch }}"
+
+          test -n "$VELA_MACOS12_SMOKE_HARNESS" || {
+            echo "VELA_MACOS12_SMOKE_HARNESS is required for production UI smoke." >&2
+            exit 1
+          }
+          test -x "$VELA_MACOS12_SMOKE_HARNESS" || {
+            echo "Missing executable macOS 12 smoke harness: $VELA_MACOS12_SMOKE_HARNESS" >&2
+            exit 1
+          }
+          "$VELA_MACOS12_SMOKE_HARNESS" \
+            --app "$install_dir/Vela.app" \
+            --arch "${{ matrix.arch }}"

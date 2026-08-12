@@ -1,0 +1,19 @@
+{
+  "media_tools": [
+    {
+      "name": "REPLACE_ME_WITH_TOOL_NAME",
+      "version": "REPLACE_ME_WITH_EXACT_UPSTREAM_VERSION",
+      "upstream_url": "https://example.invalid/replace-with-upstream-project",
+      "source_url": "https://example.invalid/replace-with-corresponding-source",
+      "declared_license": "REPLACE_ME_WITH_SPDX_LICENSE_EXPRESSION",
+      "build_configuration": "REPLACE_ME_WITH_EXACT_BUILD_CONFIGURATION",
+      "source_offer": "REPLACE_ME_WITH_SOURCE_OFFER_OR_ARCHIVE_REFERENCE",
+      "files": [
+        {
+          "path": "REPLACE_ME_WITH_BUNDLED_RELATIVE_PATH",
+          "sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+        }
+      ]
+    }
+  ]
+}

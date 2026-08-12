@@ -1,0 +1,6 @@
+# Copy this file outside the repository, replace each placeholder with the
+# SHA-256 supplied or independently verified for the approved native binary,
+# then set VELA_TOOLS_CHECKSUMS to that file.
+REPLACE_WITH_SHA256  ffmpeg
+REPLACE_WITH_SHA256  ffprobe
+REPLACE_WITH_SHA256  fpcalc

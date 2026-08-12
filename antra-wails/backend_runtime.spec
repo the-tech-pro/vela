@@ -1,25 +1,48 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""
-PyInstaller spec for VelaBackend.exe — the self-contained Python backend
-that gets embedded into the Wails desktop app via runtime_assets.go.
+"""Platform-aware PyInstaller build for Vela's Python backend.
 
-Build from the antra-wails/ directory:
-    pyinstaller backend_runtime.spec --distpath ./runtime/backend --noconfirm
-
-The output VelaBackend.exe lands in runtime/backend/ and is automatically
-embedded by `wails build` via the //go:embed directive in runtime_assets.go.
+Windows/Linux use a one-file executable. macOS uses an onedir helper so signed
+code remains in Vela.app/Contents/Helpers and is never unpacked to a temporary
+directory at runtime. VELA_TOOLS_DIR must contain ffmpeg, ffprobe and fpcalc.
 """
 
+import os
+import sys
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_data_files, collect_submodules, collect_dynamic_libs
+from PyInstaller.utils.hooks import (
+    collect_data_files,
+    collect_submodules,
+    collect_dynamic_libs,
+    copy_metadata,
+)
 
 ROOT = Path.cwd().parent  # Antra/
 ENTRY = ROOT / "antra" / "json_cli.py"
+IS_DARWIN = sys.platform == "darwin"
+if IS_DARWIN:
+    os.environ.setdefault("MACOSX_DEPLOYMENT_TARGET", "12.0")
+TARGET_ARCH = os.environ.get("VELA_TARGET_ARCH") or None
+if TARGET_ARCH == "amd64":
+    TARGET_ARCH = "x86_64"
+if not IS_DARWIN:
+    TARGET_ARCH = None
+if not os.environ.get("VELA_TOOLS_DIR", "").strip():
+    raise SystemExit(
+        "VELA_TOOLS_DIR must contain approved native ffmpeg, ffprobe and fpcalc; "
+        "run builds through build_desktop.py (see docs/desktop-builds.md)"
+    )
+TOOLS_DIR = Path(os.environ["VELA_TOOLS_DIR"]).resolve()
+TOOL_SUFFIX = ".exe" if sys.platform == "win32" else ""
+tool_binaries = [
+    (str(TOOLS_DIR / f"{name}{TOOL_SUFFIX}"), "tools")
+    for name in ("ffmpeg", "ffprobe", "fpcalc")
+]
 
 # ── Hidden imports ──────────────────────────────────────────────────────────
 # PyInstaller misses dynamically-imported modules; list them explicitly.
 hiddenimports = (
     collect_submodules("antra")
+    + (collect_submodules("pytsk3") if sys.platform == "win32" else [])
     + collect_submodules("spotipy")
     + collect_submodules("mutagen")
     + collect_submodules("requests")
@@ -27,6 +50,7 @@ hiddenimports = (
     + collect_submodules("lyricsgenius")
     + collect_submodules("platformdirs")
     + collect_submodules("iopenpod", filter=lambda name: not name.startswith("iopenpod.gui"))
+    + collect_submodules("numpy")
     + collect_submodules("Cryptodome")  # pycryptodomex — used for Python CENC fallback in Amazon adapter
     + [
         # dotenv
@@ -61,6 +85,9 @@ for package in ("imageio_ffmpeg", "certifi", "lyricsgenius", "spotipy", "iopenpo
         datas += collect_data_files(package)
     except Exception:
         pass
+if sys.platform == "win32":
+    datas += copy_metadata("pytsk3")
+datas.append((str(ROOT / "THIRD_PARTY_NOTICES.md"), "."))
 
 # Explicitly exclude playwright's driver directory (node.exe + JS bundle = ~97 MB).
 # We replaced the playwright session API with raw websockets CDP calls, so node.exe
@@ -78,7 +105,7 @@ datas = [(src, dst) for src, dst in datas
 a = Analysis(
     [str(ENTRY)],
     pathex=[str(ROOT)],
-    binaries=[],
+    binaries=tool_binaries,
     datas=datas,
     hiddenimports=hiddenimports,
     hookspath=[],
@@ -91,7 +118,8 @@ a = Analysis(
         "pytest", "pytest_mock", "_pytest",
         # Jupyter / IPython
         "IPython", "jupyter", "notebook",
-        # Matplotlib / numpy / scipy — not used
+        # Large analysis/data packages not needed by the headless backend.
+        # NumPy is required by iOpenPod artwork/database paths and is retained.
         "matplotlib", "scipy", "pandas",
         # playwright.async_api and playwright.sync_api are NOT imported at runtime
         # (we use raw websockets CDP). Only playwright._impl is needed for the
@@ -107,26 +135,44 @@ a = Analysis(
 
 pyz = PYZ(a.pure)
 
-exe = EXE(
-    pyz,
-    a.scripts,
-    a.binaries,
-    a.datas,
-    [],
+exe_kwargs = dict(
     name="VelaBackend",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,           # UPX compression — shaves ~20-30% off size
-    upx_exclude=[
-        "vcruntime140.dll",
-        "python3*.dll",
-    ],
-    runtime_tmpdir=None,
-    console=True,       # Must be True — the Go parent reads stdout via pipe
+    upx=not IS_DARWIN,
+    upx_exclude=["vcruntime140.dll", "python3*.dll"],
+    console=True,
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
+    target_arch=TARGET_ARCH,
+    codesign_identity=os.environ.get("VELA_PYINSTALLER_CODESIGN_IDENTITY") or None,
+    entitlements_file=os.environ.get("VELA_BACKEND_ENTITLEMENTS") or None,
 )
+
+if IS_DARWIN:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        [],
+        exclude_binaries=True,
+        **exe_kwargs,
+    )
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.datas,
+        name="VelaBackend",
+        strip=False,
+        upx=False,
+    )
+else:
+    exe = EXE(
+        pyz,
+        a.scripts,
+        a.binaries,
+        a.datas,
+        [],
+        runtime_tmpdir=None,
+        **exe_kwargs,
+    )

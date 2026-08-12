@@ -6,15 +6,48 @@ on:
       - "v*"
   workflow_dispatch:
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
 jobs:
+  release-contract:
+    name: Validate tag release context
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require a version tag
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" != refs/tags/v* ]]; then
+            echo "Release runs must target a v* tag." >&2
+            exit 1
+          fi
+          version="$(python -c 'from build_desktop import read_product_version; print(read_product_version())')"
+          if [[ "$GITHUB_REF_NAME" != "v$version" ]]; then
+            echo "Release tag $GITHUB_REF_NAME does not match product version $version." >&2
+            exit 1
+          fi
+
   test-and-build-windows:
     name: Test and build Vela for Windows
-    runs-on: windows-latest
+    needs: release-contract
+    # Release packaging requires a native runner with owner-approved tools.
+    runs-on: [self-hosted, Windows, amd64]
+    environment: windows-release
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
     env:
       WAILS_VERSION: v2.12.0
+      VELA_TOOLS_DIR: C:\vela-tools\amd64\bin
+      VELA_TOOLS_CHECKSUMS: C:\vela-tools\amd64\SHA256SUMS
+      VELA_RELEASE_OWNER_METADATA: C:\vela-tools\amd64\owner-metadata.json
     steps:
       - uses: actions/checkout@v4
 
@@ -33,37 +66,167 @@ jobs:
           cache: npm
           cache-dependency-path: antra-wails/frontend/package-lock.json
 
+      - name: Install Python test and build dependencies
+        run: python -m pip install -r requirements-test.txt
+
+      - name: Verify capacity-unlock source and license lock
+        run: python packaging/ipod-unlock/verify_release_inputs.py
+
+      - name: Verify owner-controlled release evidence
+        shell: pwsh
+        run: |
+          if (-not (Test-Path $env:VELA_RELEASE_OWNER_METADATA -PathType Leaf)) {
+            throw "Missing owner release metadata: $env:VELA_RELEASE_OWNER_METADATA"
+          }
+          python packaging/release/release_metadata.py validate-owner `
+            --metadata $env:VELA_RELEASE_OWNER_METADATA `
+            --media-root $env:VELA_TOOLS_DIR
+
       - name: Run Python tests
-        run: python -m unittest discover tests
+        run: python -m pytest -q
 
       - name: Install frontend dependencies
         working-directory: antra-wails/frontend
         run: npm ci
 
-      - name: Build frontend assets
+      - name: Check and build frontend assets
         working-directory: antra-wails/frontend
-        run: npm run build
+        run: |
+          npm run check
+          npm run build
 
       - name: Run Go tests
         working-directory: antra-wails
         run: go test ./...
 
-      - name: Install Python build dependencies
-        run: pip install -r requirements-desktop.txt
-
       - name: Install Wails CLI
         run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
 
-      - name: Build Python backend
-        working-directory: antra-wails
-        run: pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
+      - name: Build Vela and validated backend
+        run: python build_desktop.py --target-arch amd64
 
-      - name: Build Vela
-        working-directory: antra-wails
-        run: wails build -clean
+      - name: Stage normalized Windows executable
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item antra-wails/build/bin/Vela.exe release/Vela-Windows-amd64.exe
 
-      - name: Upload Vela
+      - name: Generate packaged-app SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          file: release/Vela-Windows-amd64.exe
+          format: spdx-json
+          output-file: release/Vela-Windows-amd64.syft.spdx.json
+          upload-artifact: false
+          upload-release-assets: false
+
+      - name: Add final artifact and owner evidence to SBOM
+        shell: pwsh
+        run: |
+          python packaging/release/release_metadata.py augment `
+            --base-spdx release/Vela-Windows-amd64.syft.spdx.json `
+            --artifact release/Vela-Windows-amd64.exe `
+            --owner-metadata $env:VELA_RELEASE_OWNER_METADATA `
+            --media-root $env:VELA_TOOLS_DIR `
+            --platform windows `
+            --architecture amd64 `
+            --output release/Vela-Windows-amd64.spdx.json
+          Remove-Item release/Vela-Windows-amd64.syft.spdx.json
+
+      - name: Generate build provenance
+        id: provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: release/Vela-Windows-amd64.exe
+
+      - name: Stage provenance bundle
+        shell: pwsh
+        run: >-
+          Copy-Item
+          "${{ steps.provenance.outputs.bundle-path }}"
+          "release/Vela-Windows-amd64.provenance.json"
+
+      - name: Upload Windows release payload
         uses: actions/upload-artifact@v4
         with:
-          name: Vela-Windows
-          path: antra-wails/build/bin/Vela.exe
+          name: Vela-release-Windows-amd64
+          path: release/*
+          if-no-files-found: error
+
+  macos:
+    name: Build, sign and smoke-test native macOS artifacts
+    needs: release-contract
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/macos.yml
+    with:
+      sign_and_notarize: true
+
+  publish-release:
+    name: Publish verified release assets
+    needs:
+      - release-contract
+      - test-and-build-windows
+      - macos
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download platform payloads
+        uses: actions/download-artifact@v4
+        with:
+          pattern: Vela-release-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Verify release contract and create checksums
+        shell: bash
+        run: |
+          python - <<'PY'
+          from hashlib import sha256
+          from pathlib import Path
+
+          root = Path("release-assets")
+          expected = {
+              "Vela-Windows-amd64.exe",
+              "Vela-Windows-amd64.spdx.json",
+              "Vela-Windows-amd64.provenance.json",
+              "Vela-macOS-arm64.dmg",
+              "Vela-macOS-arm64.spdx.json",
+              "Vela-macOS-arm64.provenance.json",
+              "Vela-macOS-amd64.dmg",
+              "Vela-macOS-amd64.spdx.json",
+              "Vela-macOS-amd64.provenance.json",
+          }
+          actual = {path.name for path in root.iterdir() if path.is_file()}
+          if actual != expected:
+              missing = sorted(expected - actual)
+              unexpected = sorted(actual - expected)
+              raise SystemExit(
+                  f"release artifact contract mismatch; missing={missing}, unexpected={unexpected}"
+              )
+
+          lines = []
+          for name in sorted(expected):
+              digest = sha256((root / name).read_bytes()).hexdigest()
+              lines.append(f"{digest}  {name}")
+          (root / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+
+      - name: Create verified GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists; refusing an in-place asset replacement." >&2
+            exit 1
+          fi
+          gh release create "$GITHUB_REF_NAME" release-assets/* \
+            --draft \
+            --generate-notes \
+            --title "$GITHUB_REF_NAME" \
+            --verify-tag
+          gh release edit "$GITHUB_REF_NAME" --draft=false

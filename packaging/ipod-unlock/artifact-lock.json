@@ -1,0 +1,55 @@
+{
+  "schema_version": 2,
+  "apple_firmware": {
+    "filename": "iPod_35.2.0.2.ipsw",
+    "url": "https://secure-appldnld.apple.com/iPod/SBML/osx/bundles/061-6797.20090909.3uTfE/iPod_35.2.0.2.ipsw",
+    "size": 61033067,
+    "sha1": "5a7ab72fd7e299118bb0f25adfea1ad4808e1f0a",
+    "sha256": "a12f25067a821850979efe8222de6e2bb98eba985ba21f61abe386355c6655b4",
+    "redistributable": false
+  },
+  "rockbox_utility": {
+    "version": "1.5.1",
+    "released": "2022-04-18",
+    "windows": {
+      "filename": "RockboxUtility-v1.5.1.zip",
+      "url": "https://download.rockbox.org/rbutil/win32/RockboxUtility-v1.5.1.zip",
+      "size": 13661541,
+      "sha256": "3226b5ede00bd7d7a0458af4f5428b8080c7983650e14087b6b4050d6a23c46d"
+    },
+    "source": {
+      "filename": "RockboxUtility-v1.5.1-src.tar.bz2",
+      "url": "https://download.rockbox.org/rbutil/source/RockboxUtility-v1.5.1-src.tar.bz2",
+      "size": 1495776,
+      "sha256": "82e34ed756b4777d117b13c400040622057d5b5ef38138d9fcb373fe8527e073",
+      "contains": "utils/mks5lboot"
+    },
+    "license": "GPL-2.0-or-later"
+  },
+  "olsro": {
+    "repository": "https://github.com/Olsro/reddit-ipod-guides.git",
+    "revision": "1f3d33805259c1c2b58a5076bb3580e86bacdaf1",
+    "syscfg_editor_source": {
+      "filename": "iPodSysCFGEditor-SourcesOnlyForDevs.7z",
+      "size": 106847,
+      "sha256": "2e51d5e8fcf4ac36d42222869a3edb77f1527a4c34d326fb112be37b46c31017"
+    },
+    "rockbox_patch": {
+      "filename": "rockbox-2df1172-ipod6g-syscfg.patch",
+      "size": 5827,
+      "sha256": "6eb01128105d875d24db8828f1b4f73250279527fb71d161c42aee1e5924feac"
+    }
+  },
+  "rockbox": {
+    "repository": "https://git.rockbox.org/cgit/rockbox.git",
+    "mirror": "https://github.com/Rockbox/rockbox.git",
+    "commit": "2df1172e985c45e9bf7fe3283bbb42dfaa36c735",
+    "target": "ipod6g",
+    "license": "GPL-2.0-or-later"
+  },
+  "vela_readback_patch": {
+    "filename": "vela-rockbox-syscfg-readback.patch",
+    "sha256": "321a42df1247d05acc1332468b4afb845ede9c304694a60e1380f1a63deab405",
+    "license": "GPL-2.0-or-later"
+  }
+}
