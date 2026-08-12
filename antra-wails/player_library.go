@@ -1,12 +1,13 @@
 package main
 
 import (
+	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io/fs"
-	"math/rand"
 	"mime"
 	"net"
 	"net/http"
@@ -18,8 +19,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 type libraryReleaseSummary struct {
@@ -61,40 +60,6 @@ type libraryPayload struct {
 	Playlists []libraryReleaseSummary `json:"playlists"`
 }
 
-type downloadedLibraryCache struct {
-	Root      string                          `json:"root"`
-	Payload   libraryPayload                  `json:"payload"`
-	Details   map[string]libraryReleaseDetail `json:"details,omitempty"`
-	IndexedAt int64                           `json:"indexed_at"`
-}
-
-func downloadedLibraryCachePath() string {
-	return filepath.Join(getAppDataDir(), "downloaded-library-index.json")
-}
-
-func readDownloadedLibraryCache() downloadedLibraryCache {
-	var cache downloadedLibraryCache
-	data, err := os.ReadFile(downloadedLibraryCachePath())
-	if err == nil {
-		_ = json.Unmarshal(data, &cache)
-	}
-	if cache.Details == nil {
-		cache.Details = make(map[string]libraryReleaseDetail)
-	}
-	return cache
-}
-
-func writeDownloadedLibraryCache(cache downloadedLibraryCache) error {
-	data, err := json.Marshal(cache)
-	if err != nil {
-		return err
-	}
-	if err := os.MkdirAll(getAppDataDir(), 0755); err != nil {
-		return err
-	}
-	return os.WriteFile(downloadedLibraryCachePath(), data, 0644)
-}
-
 var (
 	playerAudioExtensions = map[string]bool{
 		".flac": true,
@@ -128,17 +93,17 @@ func (a *App) GetDownloadedMusicLibrary() string {
 	}
 
 	_ = a.ensureMediaServer()
-	cache := readDownloadedLibraryCache()
-	if filepath.Clean(cache.Root) == filepath.Clean(root) && (len(cache.Payload.Albums) > 0 || len(cache.Payload.Playlists) > 0) {
+	cache, _ := a.downloadedLibraryStore().readSummary()
+	if sameDownloadedLibraryRoot(cache.Root, root) && (len(cache.Payload.Albums) > 0 || len(cache.Payload.Playlists) > 0) {
 		if time.Now().Unix()-cache.IndexedAt > 300 {
-			go a.refreshDownloadedLibraryIndex(root, cfg)
+			a.refreshDownloadedLibraryIndex(root, cfg)
 		}
 		payload := cache.Payload
 		a.refreshCachedArtworkURLs(&payload, cache.Details)
 		data, _ := json.Marshal(payload)
 		return string(data)
 	}
-	go a.refreshDownloadedLibraryIndex(root, cfg)
+	a.refreshDownloadedLibraryIndex(root, cfg)
 	return `{"albums":[],"playlists":[]}`
 }
 
@@ -149,9 +114,9 @@ func (a *App) RefreshDownloadedMusicLibrary() string {
 		return `{"albums":[],"playlists":[],"error":"Download path not configured"}`
 	}
 	_ = a.ensureMediaServer()
-	cache := readDownloadedLibraryCache()
-	go a.refreshDownloadedLibraryIndex(root, cfg)
-	if filepath.Clean(cache.Root) == filepath.Clean(root) {
+	cache, _ := a.downloadedLibraryStore().readSummary()
+	a.refreshDownloadedLibraryIndex(root, cfg)
+	if sameDownloadedLibraryRoot(cache.Root, root) {
 		payload := cache.Payload
 		a.refreshCachedArtworkURLs(&payload, cache.Details)
 		data, _ := json.Marshal(payload)
@@ -188,172 +153,6 @@ func (a *App) refreshCachedArtworkURLs(payload *libraryPayload, details map[stri
 	refresh(payload.Playlists)
 }
 
-func (a *App) refreshDownloadedLibraryIndex(root string, cfg Config) {
-	a.mu.Lock()
-	if a.downloadIndexing {
-		a.mu.Unlock()
-		return
-	}
-	a.downloadIndexing = true
-	indexCmd := a.indexCmd
-	if indexCmd != nil {
-		a.indexCmd = nil
-	}
-	a.mu.Unlock()
-	if indexCmd != nil {
-		_ = killCommandTree(indexCmd)
-		wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
-			"type": "apple_index_paused", "label": "Index paused while checking downloads",
-		})
-	}
-	defer func() {
-		a.mu.Lock()
-		a.downloadIndexing = false
-		a.mu.Unlock()
-		if recovered := recover(); recovered != nil {
-			wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{
-				"type": "error", "message": fmt.Sprintf("Downloaded music indexing failed: %v", recovered),
-			})
-		}
-		if indexCmd != nil {
-			a.mu.Lock()
-			downloadActive := a.activeCmd != nil
-			if downloadActive {
-				a.indexRestartAfterDownload = true
-			}
-			a.mu.Unlock()
-			if !downloadActive {
-				go func() {
-					if err := a.StartAppleMusicIndex(); err != nil {
-						wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
-							"type": "apple_index_error", "message": fmt.Sprintf("Could not resume library indexing: %v", err),
-						})
-					}
-				}()
-			}
-		}
-	}()
-	wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{"type": "progress", "percent": 0, "label": "Finding downloads"})
-	library, indexErrors, err := a.rebuildDownloadedLibraryIndex(root, cfg, func(percent int, label string) {
-		wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{"type": "progress", "percent": percent, "label": label})
-	})
-	if err != nil {
-		wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{"type": "error", "message": err.Error()})
-		return
-	}
-	if len(indexErrors) > 0 {
-		wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{
-			"type": "warning", "message": fmt.Sprintf("%d downloaded release(s) could not be indexed", len(indexErrors)), "errors": indexErrors,
-		})
-	}
-	wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{"type": "complete", "percent": 100, "library": library})
-}
-
-func (a *App) rebuildDownloadedLibraryIndex(root string, cfg Config, progress func(int, string)) (libraryPayload, []string, error) {
-	if info, err := os.Stat(root); err != nil || !info.IsDir() {
-		if err == nil {
-			err = fmt.Errorf("download path is not a folder")
-		}
-		return libraryPayload{}, nil, fmt.Errorf("could not index downloaded music: %w", err)
-	}
-	albumStructure := cfg.AlbumFolderStructure
-	if albumStructure == "" {
-		albumStructure = cfg.FolderStructure
-	}
-	if progress != nil {
-		progress(2, "Finding downloaded albums")
-	}
-	albums := a.scanReleaseSummaries(root, "album", albumStructure)
-	if progress != nil {
-		progress(6, "Finding downloaded playlists")
-	}
-	playlists := a.scanReleaseSummaries(root, "playlist", cfg.PlaylistFolderStructure)
-	payload := libraryPayload{Albums: albums, Playlists: playlists}
-	if progress != nil {
-		progress(10, "Reading cached metadata")
-	}
-	cache := readDownloadedLibraryCache()
-	cache.Root = root
-	cache.Payload = payload
-	allReleases := append(append([]libraryReleaseSummary{}, payload.Albums...), payload.Playlists...)
-	totalUnits := 1
-	for _, release := range allReleases {
-		totalUnits += 1 + max(1, release.TrackCount)
-	}
-	completedUnits := 0
-	lastPercent := 10
-	indexErrors := make([]string, 0)
-	reportUnit := func(label string) {
-		if completedUnits >= totalUnits-1 {
-			return
-		}
-		completedUnits++
-		percent := 10 + (completedUnits * 89 / totalUnits)
-		if progress != nil && percent != lastPercent {
-			progress(percent, label)
-			lastPercent = percent
-		}
-	}
-	for index, release := range allReleases {
-		cacheKey := filepath.ToSlash(release.RelativePath)
-		cached, ok := cache.Details[cacheKey]
-		if !ok || cached.TrackCount != release.TrackCount {
-			detail, detailErr := a.buildDownloadedReleaseDetail(root, release, func() { reportUnit(release.Title) })
-			if detailErr == nil {
-				cache.Details[cacheKey] = detail
-			} else {
-				indexErrors = append(indexErrors, fmt.Sprintf("%s: %v", release.Title, detailErr))
-				for skipped := 0; skipped < max(1, release.TrackCount); skipped++ {
-					reportUnit(release.Title)
-				}
-			}
-		} else {
-			for indexed := 0; indexed < max(1, release.TrackCount); indexed++ {
-				reportUnit(release.Title)
-			}
-		}
-		reportUnit(release.Title)
-		if (index+1)%5 == 0 {
-			_ = writeDownloadedLibraryCache(cache)
-		}
-	}
-	if progress != nil {
-		progress(99, "Saving download index")
-	}
-	cache.IndexedAt = time.Now().Unix()
-	if err := writeDownloadedLibraryCache(cache); err != nil {
-		return libraryPayload{}, indexErrors, fmt.Errorf("could not save downloaded music index: %w", err)
-	}
-
-	return payload, indexErrors, nil
-}
-
-func (a *App) buildDownloadedReleaseDetail(root string, summary libraryReleaseSummary, trackIndexed func()) (libraryReleaseDetail, error) {
-	absolutePath, err := resolveLibraryPath(root, summary.RelativePath)
-	if err != nil {
-		return libraryReleaseDetail{}, err
-	}
-	info, err := os.Stat(absolutePath)
-	if err != nil || !info.IsDir() {
-		return libraryReleaseDetail{}, fmt.Errorf("release folder not found")
-	}
-	trackPaths := collectAudioFiles(absolutePath)
-	sort.Strings(trackPaths)
-	tracks := make([]libraryReleaseTrack, 0, len(trackPaths))
-	for _, trackPath := range trackPaths {
-		track := libraryReleaseTrack{FileName: filepath.Base(trackPath), FilePath: filepath.ToSlash(trackPath), AudioURL: a.mediaURL("audio", trackPath), Artist: summary.Artist, Album: summary.Title}
-		applyTrackFallbackMetadata(&track)
-		applyTrackProbeMetadata(&track, a.ffprobeExe)
-		tracks = append(tracks, track)
-		if trackIndexed != nil {
-			trackIndexed()
-		}
-	}
-	detail := libraryReleaseDetail{Kind: summary.Kind, RelativePath: filepath.ToSlash(summary.RelativePath), Title: summary.Title, Artist: summary.Artist, Year: summary.Year, TrackCount: len(tracks), Tracks: tracks}
-	detail.ArtworkURL = a.artworkURLForRelease(absolutePath, trackPaths)
-	return detail, nil
-}
-
 func (a *App) GetDownloadedRelease(relativePath string) string {
 	cfg := a.GetConfig()
 	root := strings.TrimSpace(cfg.DownloadPath)
@@ -362,21 +161,28 @@ func (a *App) GetDownloadedRelease(relativePath string) string {
 	}
 
 	_ = a.ensureMediaServer()
-	cache := readDownloadedLibraryCache()
+	store := a.downloadedLibraryStore()
+	cache, _ := store.readSummary()
 	cacheKey := filepath.ToSlash(relativePath)
-	if filepath.Clean(cache.Root) == filepath.Clean(root) {
+	if sameDownloadedLibraryRoot(cache.Root, root) {
 		if detail, ok := cache.Details[cacheKey]; ok {
-			trackPaths := make([]string, 0, len(detail.Tracks))
-			for index := range detail.Tracks {
-				detail.Tracks[index].AudioURL = a.mediaURL("audio", detail.Tracks[index].FilePath)
-				trackPaths = append(trackPaths, detail.Tracks[index].FilePath)
-			}
-			if absolutePath, err := resolveLibraryPath(root, relativePath); err == nil {
-				detail.ArtworkURL = a.artworkURLForRelease(absolutePath, trackPaths)
-			}
+			a.refreshDownloadedDetailURLs(root, relativePath, &detail)
 			data, _ := json.Marshal(detail)
 			return string(data)
 		}
+		if stub, ok := cache.Records[cacheKey]; ok {
+			if record, err := store.readRecordFile(stub.Shard); err == nil &&
+				record.CacheKey == cacheKey &&
+				record.Fingerprint == stub.Fingerprint {
+				detail := record.Detail
+				a.refreshDownloadedDetailURLs(root, relativePath, &detail)
+				data, _ := json.Marshal(detail)
+				return string(data)
+			}
+		}
+	}
+	if !sameDownloadedLibraryRoot(cache.Root, root) {
+		cache = newDownloadedLibraryCache()
 	}
 	absolutePath, err := resolveLibraryPath(root, relativePath)
 	if err != nil {
@@ -389,38 +195,36 @@ func (a *App) GetDownloadedRelease(relativePath string) string {
 	}
 
 	kind := inferReleaseKind(relativePath)
-	title, artist, year := inferReleaseNames(absolutePath, kind, root)
-	trackPaths := collectAudioFiles(absolutePath)
-	sort.Strings(trackPaths)
-
-	tracks := make([]libraryReleaseTrack, 0, len(trackPaths))
-	for _, trackPath := range trackPaths {
-		track := libraryReleaseTrack{
-			FileName: filepath.Base(trackPath),
-			FilePath: filepath.ToSlash(trackPath),
-			AudioURL: a.mediaURL("audio", trackPath),
-			Artist:   artist,
-			Album:    title,
+	candidate, err := a.buildDownloadedReleaseCandidate(root, kind, absolutePath)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%q}`, err.Error())
+	}
+	previous := cache.Records[cacheKey]
+	if previous.Shard != "" {
+		if full, loadErr := store.readRecordFile(previous.Shard); loadErr == nil {
+			previous = full
 		}
-		applyTrackFallbackMetadata(&track)
-		applyTrackProbeMetadata(&track, a.ffprobeExe)
-		tracks = append(tracks, track)
 	}
-
-	detail := libraryReleaseDetail{
-		Kind:         kind,
-		RelativePath: filepath.ToSlash(relativePath),
-		Title:        title,
-		Artist:       artist,
-		Year:         year,
-		TrackCount:   len(tracks),
-		Tracks:       tracks,
+	if exact, ok := store.readRecord(cacheKey, candidate.ReleaseFingerprint); ok {
+		previous = exact
 	}
-	detail.ArtworkURL = a.artworkURLForRelease(absolutePath, trackPaths)
+	record, err := a.buildDownloadedReleaseRecord(context.Background(), candidate, previous, nil)
+	if err != nil {
+		return fmt.Sprintf(`{"error":%q}`, err.Error())
+	}
+	if persisted, persistErr := store.writeRecord(record); persistErr == nil {
+		record = persisted
+	}
+	detail := record.Detail
 	cache.Root = root
+	cache.SchemaVersion = downloadedLibraryIndexSchemaVersion
+	cache.Records[cacheKey] = record
 	cache.Details[cacheKey] = detail
+	upsertDownloadedReleaseSummary(&cache.Payload, candidate.Summary)
 	cache.IndexedAt = time.Now().Unix()
-	_ = writeDownloadedLibraryCache(cache)
+	a.downloadedCacheWriteMu.Lock()
+	_ = store.writeManifest(cache)
+	a.downloadedCacheWriteMu.Unlock()
 
 	data, err := json.Marshal(detail)
 	if err != nil {
@@ -443,11 +247,11 @@ func (a *App) ensureMediaServer() string {
 		return ""
 	}
 
-	token := make([]byte, 12)
-	if _, err := rand.New(rand.NewSource(time.Now().UnixNano())).Read(token); err != nil {
-		copy(token, []byte(fmt.Sprintf("%d", time.Now().UnixNano())))
+	tokenHex, err := newMediaToken()
+	if err != nil {
+		_ = listener.Close()
+		return ""
 	}
-	tokenHex := hex.EncodeToString(token)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/media/audio", a.handleAudioMedia)
@@ -475,6 +279,14 @@ func (a *App) ensureMediaServer() string {
 		_ = server.Close()
 	}
 	return base
+}
+
+func newMediaToken() (string, error) {
+	token := make([]byte, 24)
+	if _, err := rand.Read(token); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(token), nil
 }
 
 func (a *App) handleAudioMedia(w http.ResponseWriter, r *http.Request) {
@@ -953,35 +765,73 @@ func findArtworkFile(dir string) string {
 }
 
 func (a *App) extractEmbeddedArtwork(audioPath string) (string, error) {
-	cacheDir := filepath.Join(getAppDataDir(), "player_art_cache")
-	if err := os.MkdirAll(cacheDir, 0755); err != nil {
-		return "", err
-	}
+	return a.extractEmbeddedArtworkContext(context.Background(), audioPath)
+}
 
-	outputPath := filepath.Join(cacheDir, embeddedArtworkCacheKey(audioPath)+".png")
-	if info, err := os.Stat(outputPath); err == nil && !info.IsDir() && info.Size() > 0 {
+func (a *App) extractEmbeddedArtworkContext(ctx context.Context, audioPath string) (string, error) {
+	key := embeddedArtworkCacheKey(audioPath)
+	return a.embeddedArtworkFlights.do(ctx, key, func() (string, error) {
+		cacheDir := filepath.Join(getAppDataDir(), "player_art_cache")
+		if err := os.MkdirAll(cacheDir, 0755); err != nil {
+			return "", err
+		}
+
+		outputPath := filepath.Join(cacheDir, key+".png")
+		if info, err := os.Stat(outputPath); err == nil && !info.IsDir() && info.Size() > 0 {
+			return outputPath, nil
+		}
+		a.mu.Lock()
+		hook := a.embeddedArtworkHook
+		a.mu.Unlock()
+		if hook != nil {
+			a.incrementPerf("ffmpeg")
+			return hook(ctx, audioPath)
+		}
+		temp, err := os.CreateTemp(cacheDir, key+"-*.png")
+		if err != nil {
+			return "", err
+		}
+		tempPath := temp.Name()
+		if err := temp.Close(); err != nil {
+			_ = os.Remove(tempPath)
+			return "", err
+		}
+		defer os.Remove(tempPath)
+
+		a.mu.Lock()
+		ffmpegExe := a.ffmpegExe
+		a.mu.Unlock()
+		a.incrementPerf("ffmpeg")
+		cmd := exec.CommandContext(
+			ctx,
+			resolveExe(ffmpegExe, "ffmpeg"),
+			"-y",
+			"-nostdin",
+			"-i", audioPath,
+			"-an",
+			"-map", "0:v:0",
+			"-frames:v", "1",
+			tempPath,
+		)
+		hideProcess(cmd)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			return "", fmt.Errorf("ffmpeg artwork extract: %w (%s)", err, strings.TrimSpace(string(out)))
+		}
+		if info, err := os.Stat(tempPath); err != nil || info.IsDir() || info.Size() == 0 {
+			if err == nil {
+				err = fmt.Errorf("ffmpeg produced empty artwork")
+			}
+			return "", err
+		}
+		if err := replaceFileAtomic(tempPath, outputPath); err != nil {
+			return "", err
+		}
 		return outputPath, nil
-	}
-
-	cmd := exec.Command(
-		resolveExe(a.ffmpegExe, "ffmpeg"),
-		"-y",
-		"-i", audioPath,
-		"-an",
-		"-map", "0:v:0",
-		"-frames:v", "1",
-		outputPath,
-	)
-	hideProcess(cmd)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		_ = os.Remove(outputPath)
-		return "", fmt.Errorf("ffmpeg artwork extract: %w (%s)", err, strings.TrimSpace(string(out)))
-	}
-	return outputPath, nil
+	})
 }
 
 func embeddedArtworkCacheKey(audioPath string) string {
-	identity := strings.ToLower(filepath.Clean(audioPath))
+	identity := normalizedCompletePath(audioPath)
 	if info, err := os.Stat(audioPath); err == nil {
 		identity = fmt.Sprintf("%s|%d|%d", identity, info.Size(), info.ModTime().UnixNano())
 	}
@@ -1008,6 +858,10 @@ func resolveLibraryPath(root, requested string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	rootResolved, err := filepath.EvalSymlinks(rootAbs)
+	if err != nil {
+		return "", fmt.Errorf("resolve library root: %w", err)
+	}
 
 	if requested == "" {
 		return "", fmt.Errorf("empty path")
@@ -1022,12 +876,15 @@ func resolveLibraryPath(root, requested string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
-	rel, err := filepath.Rel(rootAbs, targetAbs)
+	targetResolved, err := filepath.EvalSymlinks(targetAbs)
+	if err != nil {
+		return "", fmt.Errorf("resolve requested path: %w", err)
+	}
+	rel, err := filepath.Rel(rootResolved, targetResolved)
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("path escapes library root")
 	}
-	return targetAbs, nil
+	return targetResolved, nil
 }
 
 func applyTrackFallbackMetadata(track *libraryReleaseTrack) {
@@ -1051,12 +908,43 @@ func applyTrackFallbackMetadata(track *libraryReleaseTrack) {
 	track.Title = base
 }
 
+func (a *App) applyTrackProbeMetadata(track *libraryReleaseTrack) {
+	_ = a.applyTrackProbeMetadataContext(context.Background(), track)
+}
+
+func (a *App) applyTrackProbeMetadataContext(ctx context.Context, track *libraryReleaseTrack) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	a.mu.Lock()
+	hook := a.trackProbeHook
+	ffprobeExe := a.ffprobeExe
+	a.mu.Unlock()
+	a.incrementPerf("ffprobe")
+	if hook != nil {
+		hook(ctx, track)
+		return ctx.Err()
+	}
+	probe, err := runFFProbeContext(ctx, track.FilePath, ffprobeExe)
+	if err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return nil
+	}
+	applyTrackProbeData(track, probe)
+	return nil
+}
+
 func applyTrackProbeMetadata(track *libraryReleaseTrack, ffprobeExe string) {
 	probe, err := runFFProbe(track.FilePath, ffprobeExe)
 	if err != nil {
 		return
 	}
+	applyTrackProbeData(track, probe)
+}
 
+func applyTrackProbeData(track *libraryReleaseTrack, probe map[string]interface{}) {
 	streams, _ := probe["streams"].([]interface{})
 	if len(streams) > 0 {
 		if stream, ok := streams[0].(map[string]interface{}); ok {

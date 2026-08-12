@@ -344,10 +344,7 @@ class QobuzAdapter(BaseSourceAdapter):
         with self._session.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=65536):
-                    if chunk:
-                        f.write(chunk)
+            self.write_stream_to_file(r, path, 65536)
 
 
 def _extract_qobuz_source_metadata(item: dict, album: dict) -> dict:

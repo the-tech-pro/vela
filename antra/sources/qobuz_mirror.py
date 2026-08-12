@@ -305,10 +305,7 @@ class QobuzMirrorAdapter(BaseSourceAdapter):
 
         final_path = output_path + ext
         os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
-        with open(final_path, "wb") as f:
-            for chunk in r.iter_content(131072):
-                if chunk:
-                    f.write(chunk)
+        self.write_stream_to_file(r, final_path, 131072)
 
         logger.info("[QobuzMirror] Downloaded %s quality=%s bit_depth=%s",
                     os.path.basename(final_path), quality_hdr, bit_depth_hdr)

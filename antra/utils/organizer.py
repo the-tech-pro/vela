@@ -6,8 +6,12 @@ import logging
 import os
 import re
 import shutil
+import threading
+import time
+import uuid
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Any, Iterator, Optional
 
 from mutagen.flac import FLAC
 from mutagen.id3 import ID3, TALB, TIT2, TPE1, TSRC, TXXX
@@ -24,9 +28,104 @@ from antra_shared.filename_prefs import (
 logger = logging.getLogger(__name__)
 
 STATE_FILE = ".antra_state.json"
+IDENTITY_INDEX_FILE = ".antra_identity_index.json"
+IDENTITY_INDEX_SCHEMA_VERSION = 1
 TRACK_KEY_PREFIX = "TRACK:"
 FAILED_PREFIX = "FAILED:"
 SUPPORTED_AUDIO_EXTENSIONS = (".flac", ".mp3", ".aac", ".m4a", ".mp4", ".opus")
+_PERSIST_BATCH_MUTATIONS = 4
+_PERSIST_DELAY_SECONDS = 0.25
+_FILE_LOCK_TIMEOUT_SECONDS = 0.2
+_FILE_LOCK_STALE_SECONDS = 30.0
+
+
+@contextmanager
+def _exclusive_file_lock(
+    path: Path,
+    *,
+    timeout: float = _FILE_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[bool]:
+    """Best-effort cross-process lock using an atomic lock-file create.
+
+    Persistence is deliberately lock tolerant: callers keep their dirty
+    in-memory updates and retry later when another process owns the lock.
+    Stale lock files left by a terminated process are reclaimed.
+    """
+    deadline = time.monotonic() + max(0.0, timeout)
+    token = f"{os.getpid()}:{threading.get_ident()}:{uuid.uuid4().hex}"
+    acquired = False
+    while True:
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            try:
+                os.write(descriptor, token.encode("ascii"))
+            except OSError:
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+                break
+            finally:
+                os.close(descriptor)
+            acquired = True
+            break
+        except FileExistsError:
+            try:
+                if time.time() - path.stat().st_mtime > _FILE_LOCK_STALE_SECONDS:
+                    path.unlink()
+                    continue
+            except FileNotFoundError:
+                continue
+            except OSError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.01)
+                continue
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.01)
+        except OSError:
+            break
+
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                if path.read_text(encoding="ascii") == token:
+                    path.unlink()
+            except (FileNotFoundError, OSError, UnicodeError):
+                pass
+
+
+def _read_json_object(path: Path) -> Optional[dict[str, Any]]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _atomic_replace_json(path: Path, value: dict[str, Any]) -> bool:
+    """Write JSON through a unique same-directory file and atomic replace."""
+    temp_path = path.with_name(
+        f".{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with temp_path.open("x", encoding="utf-8", newline="\n") as handle:
+            json.dump(value, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, path)
+        return True
+    except Exception as exc:
+        logger.warning("Could not persist %s: %s", path.name, exc)
+        try:
+            temp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
 
 
 class LibraryOrganizer:
@@ -86,10 +185,23 @@ class LibraryOrganizer:
         self.albums_root = self.root
         self.playlists_root = self.root
         self._state_path = self.root / STATE_FILE
+        self._identity_cache_path = self.root / IDENTITY_INDEX_FILE
+        self._state_lock = threading.RLock()
+        self._pending_state_updates: dict[str, str] = {}
+        self._pending_mutations = 0
+        self._persistence_timer: Optional[threading.Timer] = None
+        self._identity_records: dict[str, dict[str, Any]] = {}
+        self._identity_pending_upserts: dict[str, dict[str, Any]] = {}
+        self._identity_pending_deletions: dict[str, dict[str, Any]] = {}
+        self._identity_force_rewrite = False
+        self._identity_cache_complete = True
         self._state = self._load_state()
         self._identity_index: dict[str, str] = {}
+        self._identity_candidates: dict[str, list[str]] = {}
         if not full_albums:
             self._build_identity_index()
+        else:
+            self._load_identity_records_without_scan()
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -241,9 +353,11 @@ class LibraryOrganizer:
         """
         if self.filename_preferences.get("filename_conflict_behavior") == "skip" and not self.full_albums:
             for key in self._track_identity_keys(track):
-                existing = self._identity_index.get(key)
-                if existing and os.path.exists(existing):
-                    return existing
+                for existing in tuple(self._identity_candidates.get(key, ())):
+                    if not os.path.exists(existing):
+                        continue
+                    if key in self._identity_keys_for_path(Path(existing)):
+                        return existing
 
         # Check the expected canonical path for this exact request.
         base = self.get_output_path(track)
@@ -272,9 +386,26 @@ class LibraryOrganizer:
         self._mark_done(track, file_path)
 
     def mark_failed(self, track: TrackMetadata, reason: str):
-        for key in self._track_identity_keys(track):
-            self._state[f"{FAILED_PREFIX}{key}"] = reason
-        self._save_state()
+        with self._state_lock:
+            for key in self._track_identity_keys(track):
+                state_key = f"{FAILED_PREFIX}{key}"
+                self._state[state_key] = reason
+                self._pending_state_updates[state_key] = reason
+            self._pending_mutations += 1
+            self._save_state()
+
+    def flush(self) -> bool:
+        """Synchronously persist pending completed-state and identity updates."""
+        with self._state_lock:
+            if self._persistence_timer is not None:
+                self._persistence_timer.cancel()
+                self._persistence_timer = None
+            success = self._flush_persistence_locked()
+            if not success and (
+                self._pending_state_updates or self._identity_cache_is_dirty()
+            ):
+                self._schedule_persistence_locked()
+            return success
 
     def ensure_request_copy(self, track: TrackMetadata, canonical_path: str) -> str:
         """Materialize a matching local file in this request's exact folder.
@@ -350,10 +481,16 @@ class LibraryOrganizer:
 
     def _mark_done(self, track: TrackMetadata, path: str):
         resolved = str(Path(path).resolve())
-        for key in self._track_identity_keys(track):
-            self._state[f"{TRACK_KEY_PREFIX}{key}"] = resolved
-            self._identity_index[key] = resolved
-        self._save_state()
+        identity_keys = self._track_identity_keys(track)
+        with self._state_lock:
+            for key in identity_keys:
+                state_key = f"{TRACK_KEY_PREFIX}{key}"
+                self._state[state_key] = resolved
+                self._pending_state_updates[state_key] = resolved
+                self._add_identity_candidate(key, resolved, prefer=True)
+            self._upsert_completed_identity_record(Path(resolved), identity_keys)
+            self._pending_mutations += 1
+            self._save_state()
 
     def _track_identity_keys(self, track: TrackMetadata) -> list[str]:
         keys: list[str] = []
@@ -383,20 +520,377 @@ class LibraryOrganizer:
         return list(dict.fromkeys(keys))
 
     def _build_identity_index(self):
-        for key, path in self._load_track_entries_from_state().items():
-            if os.path.exists(path):
-                self._identity_index.setdefault(key, path)
+        cache_valid, old_records = self._load_identity_cache_records()
+        scan_errors: list[OSError] = []
+        new_records: dict[str, dict[str, Any]] = {}
+        reusable_by_file_id: dict[tuple[int, int, int, int], list[dict[str, Any]]] = {}
+        if cache_valid:
+            for record in old_records.values():
+                file_id = self._record_file_id(record)
+                if file_id is not None and record.get("complete") is True:
+                    reusable_by_file_id.setdefault(file_id, []).append(record)
 
-        for file_path in self.root.rglob("*"):
-            if not file_path.is_file() or file_path.suffix.lower() not in SUPPORTED_AUDIO_EXTENSIONS:
-                continue
+        for file_path in self._iter_audio_files(scan_errors):
             try:
-                identity_keys = self._extract_identity_keys_from_file(file_path)
-            except Exception as e:
-                logger.debug(f"Library scan skipped {file_path}: {e}")
+                before = file_path.stat()
+            except OSError as exc:
+                scan_errors.append(exc)
                 continue
-            for key in identity_keys:
-                self._identity_index.setdefault(key, str(file_path.resolve()))
+            path_key = self._normalized_path(file_path)
+            old_record = old_records.get(path_key)
+            if (
+                cache_valid
+                and old_record is not None
+                and old_record.get("complete") is True
+                and self._record_matches_stat(old_record, before)
+            ):
+                new_records[path_key] = dict(old_record)
+                continue
+
+            reused_record: Optional[dict[str, Any]] = None
+            if cache_valid:
+                file_id = self._stat_file_id(before)
+                candidates = reusable_by_file_id.get(file_id, ()) if file_id is not None else ()
+                if candidates:
+                    reused_keys = sorted({
+                        key
+                        for candidate in candidates
+                        for key in candidate.get("keys", ())
+                        if isinstance(key, str)
+                    })
+                    reused_record = self._identity_record(
+                        file_path,
+                        before,
+                        reused_keys,
+                        complete=True,
+                    )
+
+            record = reused_record or self._probe_identity_record(file_path, before)
+            if record is not None:
+                new_records[path_key] = record
+
+        if scan_errors and cache_valid:
+            # A permission/transient enumeration failure is not evidence that a
+            # previously indexed file was deleted.
+            for path_key, record in old_records.items():
+                new_records.setdefault(path_key, record)
+
+        self._merge_completed_state_identities(new_records)
+        self._identity_records = new_records
+        self._identity_cache_complete = not scan_errors
+        self._rebuild_identity_lookup()
+
+        if not cache_valid:
+            self._identity_force_rewrite = True
+            self._identity_pending_upserts = dict(new_records)
+        else:
+            for path_key, record in new_records.items():
+                if old_records.get(path_key) != record:
+                    self._identity_pending_upserts[path_key] = record
+            if not scan_errors:
+                for path_key, record in old_records.items():
+                    if path_key not in new_records:
+                        self._identity_pending_deletions[path_key] = record
+
+        if self._identity_cache_is_dirty():
+            with self._state_lock:
+                if not self._flush_identity_cache_locked():
+                    self._schedule_persistence_locked()
+
+    def _load_identity_records_without_scan(self):
+        cache_valid, records = self._load_identity_cache_records()
+        if cache_valid:
+            self._identity_records = records
+            self._rebuild_identity_lookup()
+
+    def _iter_audio_files(self, errors: list[OSError]) -> Iterator[Path]:
+        def record_error(error: OSError):
+            errors.append(error)
+
+        for directory, child_directories, filenames in os.walk(
+            self.root,
+            topdown=True,
+            onerror=record_error,
+            followlinks=False,
+        ):
+            child_directories.sort(key=str.casefold)
+            filenames.sort(key=str.casefold)
+            parent = Path(directory)
+            for filename in filenames:
+                if Path(filename).suffix.lower() in SUPPORTED_AUDIO_EXTENSIONS:
+                    yield parent / filename
+
+    def _load_identity_cache_records(self) -> tuple[bool, dict[str, dict[str, Any]]]:
+        payload = _read_json_object(self._identity_cache_path)
+        valid, records, complete = self._validate_identity_cache_payload(payload)
+        if not valid or not complete:
+            return False, {}
+        return True, records
+
+    def _validate_identity_cache_payload(
+        self,
+        payload: Optional[dict[str, Any]],
+    ) -> tuple[bool, dict[str, dict[str, Any]], bool]:
+        if not payload:
+            return False, {}, False
+        if payload.get("schema_version") != IDENTITY_INDEX_SCHEMA_VERSION:
+            return False, {}, False
+        if payload.get("root") != self._normalized_path(self.root):
+            return False, {}, False
+        if not isinstance(payload.get("complete"), bool):
+            return False, {}, False
+        raw_records = payload.get("records")
+        if not isinstance(raw_records, dict):
+            return False, {}, False
+
+        records: dict[str, dict[str, Any]] = {}
+        for path_key, value in raw_records.items():
+            if not isinstance(path_key, str) or not isinstance(value, dict):
+                return False, {}, False
+            path = value.get("path")
+            keys = value.get("keys")
+            if not isinstance(path, str) or self._normalized_path(path) != path_key:
+                return False, {}, False
+            if type(value.get("size")) is not int or value["size"] < 0:
+                return False, {}, False
+            if type(value.get("mtime_ns")) is not int or value["mtime_ns"] < 0:
+                return False, {}, False
+            if not isinstance(value.get("complete"), bool):
+                return False, {}, False
+            if not isinstance(keys, list) or not all(isinstance(key, str) for key in keys):
+                return False, {}, False
+            for field in ("device", "inode"):
+                if value.get(field) is not None and type(value[field]) is not int:
+                    return False, {}, False
+            records[path_key] = {
+                "path": path,
+                "size": value["size"],
+                "mtime_ns": value["mtime_ns"],
+                "device": value.get("device"),
+                "inode": value.get("inode"),
+                "keys": list(dict.fromkeys(keys)),
+                "complete": value["complete"],
+            }
+        return True, records, payload["complete"]
+
+    @staticmethod
+    def _stat_file_id(stat_result: os.stat_result) -> Optional[tuple[int, int, int, int]]:
+        inode = int(getattr(stat_result, "st_ino", 0) or 0)
+        if inode == 0:
+            return None
+        return (
+            int(getattr(stat_result, "st_dev", 0) or 0),
+            inode,
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+        )
+
+    @staticmethod
+    def _record_file_id(record: dict[str, Any]) -> Optional[tuple[int, int, int, int]]:
+        inode = record.get("inode")
+        if not isinstance(inode, int) or inode == 0:
+            return None
+        return (
+            int(record.get("device") or 0),
+            inode,
+            int(record["size"]),
+            int(record["mtime_ns"]),
+        )
+
+    @staticmethod
+    def _record_matches_stat(record: dict[str, Any], stat_result: os.stat_result) -> bool:
+        return (
+            record.get("size") == int(stat_result.st_size)
+            and record.get("mtime_ns") == int(stat_result.st_mtime_ns)
+        )
+
+    def _identity_record(
+        self,
+        path: Path,
+        stat_result: os.stat_result,
+        keys: list[str],
+        *,
+        complete: bool,
+    ) -> dict[str, Any]:
+        inode = int(getattr(stat_result, "st_ino", 0) or 0)
+        return {
+            "path": os.path.abspath(os.path.normpath(os.fspath(path))),
+            "size": int(stat_result.st_size),
+            "mtime_ns": int(stat_result.st_mtime_ns),
+            "device": int(getattr(stat_result, "st_dev", 0) or 0) if inode else None,
+            "inode": inode or None,
+            "keys": list(dict.fromkeys(keys)),
+            "complete": complete,
+        }
+
+    def _probe_identity_record(
+        self,
+        path: Path,
+        before: os.stat_result,
+    ) -> Optional[dict[str, Any]]:
+        try:
+            keys = self._extract_identity_keys_from_file(path)
+        except Exception as exc:
+            logger.debug("Library scan could not probe %s: %s", path, exc)
+            return self._identity_record(path, before, [], complete=False)
+        try:
+            after = path.stat()
+        except OSError:
+            return None
+        if not self._record_matches_stat(self._identity_record(path, before, [], complete=True), after):
+            logger.debug("Library file changed while indexing: %s", path)
+            return self._identity_record(path, after, [], complete=False)
+        return self._identity_record(path, after, keys, complete=True)
+
+    def _merge_completed_state_identities(
+        self,
+        records: dict[str, dict[str, Any]],
+    ):
+        state_keys_by_path: dict[str, list[str]] = {}
+        for key, path in self._load_track_entries_from_state().items():
+            state_keys_by_path.setdefault(self._normalized_path(path), []).append(key)
+
+        for path_key, state_keys in state_keys_by_path.items():
+            record = records.get(path_key)
+            if not record or record.get("complete") is not True:
+                continue
+            probed_keys = list(record.get("keys", ()))
+            if not self._state_keys_match_record(state_keys, probed_keys):
+                continue
+            record["keys"] = list(dict.fromkeys([*probed_keys, *state_keys]))
+
+    @classmethod
+    def _state_keys_match_record(cls, state_keys: list[str], record_keys: list[str]) -> bool:
+        if set(state_keys).intersection(record_keys):
+            return True
+        # Filename-only formats produce a weak title key. It is safe to use
+        # that title to migrate richer completed-state keys, but a tagged file
+        # with a different artist/ISRC must not inherit stale state merely
+        # because its title happens to match.
+        if not record_keys or any(not key.startswith("title:") for key in record_keys):
+            return False
+        record_titles = {
+            title
+            for key in record_keys
+            if (title := cls._identity_key_title(key))
+        }
+        return any(cls._identity_key_title(key) in record_titles for key in state_keys)
+
+    @staticmethod
+    def _identity_key_title(key: str) -> str:
+        for prefix in ("title_artist_album:", "title_artists:", "title_artist:", "title:"):
+            if key.startswith(prefix):
+                return key[len(prefix):].split(":", 1)[0]
+        return ""
+
+    @staticmethod
+    def _normalized_path(path: os.PathLike[str] | str) -> str:
+        return os.path.normcase(os.path.abspath(os.path.normpath(os.fspath(path))))
+
+    def _rebuild_identity_lookup(self):
+        self._identity_index.clear()
+        self._identity_candidates.clear()
+        for path_key in sorted(self._identity_records):
+            record = self._identity_records[path_key]
+            if record.get("complete") is not True:
+                continue
+            for key in record.get("keys", ()):
+                self._add_identity_candidate(key, record["path"])
+
+    def _add_identity_candidate(self, key: str, path: str, *, prefer: bool = False):
+        candidates = self._identity_candidates.setdefault(key, [])
+        candidates[:] = [candidate for candidate in candidates if candidate != path]
+        if prefer:
+            candidates.insert(0, path)
+        else:
+            candidates.append(path)
+        if candidates:
+            self._identity_index[key] = candidates[0]
+
+    def _remove_identity_candidate(self, key: str, path: str):
+        candidates = self._identity_candidates.get(key)
+        if not candidates:
+            return
+        candidates[:] = [candidate for candidate in candidates if candidate != path]
+        if candidates:
+            self._identity_index[key] = candidates[0]
+        else:
+            self._identity_candidates.pop(key, None)
+            self._identity_index.pop(key, None)
+
+    def _replace_identity_record(self, path_key: str, record: dict[str, Any]):
+        old_record = self._identity_records.get(path_key)
+        if old_record:
+            for key in old_record.get("keys", ()):
+                self._remove_identity_candidate(key, old_record["path"])
+        self._identity_records[path_key] = record
+        for key in record.get("keys", ()):
+            self._add_identity_candidate(key, record["path"])
+        self._identity_pending_upserts[path_key] = record
+        self._identity_pending_deletions.pop(path_key, None)
+
+    def _delete_identity_record(self, path_key: str):
+        old_record = self._identity_records.pop(path_key, None)
+        if not old_record:
+            return
+        for key in old_record.get("keys", ()):
+            self._remove_identity_candidate(key, old_record["path"])
+        self._identity_pending_upserts.pop(path_key, None)
+        self._identity_pending_deletions[path_key] = old_record
+
+    def _upsert_completed_identity_record(self, path: Path, keys: list[str]):
+        try:
+            stat_result = path.stat()
+        except OSError:
+            return
+        path_key = self._normalized_path(path)
+        old_record = self._identity_records.get(path_key)
+        if old_record and self._record_matches_stat(old_record, stat_result):
+            keys = list(dict.fromkeys([*old_record.get("keys", ()), *keys]))
+        record = self._identity_record(path, stat_result, keys, complete=True)
+        if old_record != record:
+            self._replace_identity_record(path_key, record)
+
+    def _identity_keys_for_path(self, path: Path) -> list[str]:
+        path_key = self._normalized_path(path)
+        with self._state_lock:
+            try:
+                before = path.stat()
+            except OSError:
+                self._delete_identity_record(path_key)
+                self._schedule_persistence_locked()
+                return []
+            record = self._identity_records.get(path_key)
+            if (
+                record is not None
+                and record.get("complete") is True
+                and self._record_matches_stat(record, before)
+            ):
+                return list(record.get("keys", ()))
+
+            file_id = self._stat_file_id(before)
+            reusable = [
+                candidate
+                for candidate in self._identity_records.values()
+                if candidate.get("complete") is True
+                and self._record_file_id(candidate) == file_id
+            ] if file_id is not None else []
+            if reusable:
+                keys = sorted({
+                    key
+                    for candidate in reusable
+                    for key in candidate.get("keys", ())
+                })
+                new_record = self._identity_record(path, before, keys, complete=True)
+            else:
+                new_record = self._probe_identity_record(path, before)
+            if new_record is None:
+                self._delete_identity_record(path_key)
+                self._schedule_persistence_locked()
+                return []
+            self._replace_identity_record(path_key, new_record)
+            self._schedule_persistence_locked()
+            return list(new_record.get("keys", ())) if new_record.get("complete") else []
 
     def _load_track_entries_from_state(self) -> dict[str, str]:
         entries: dict[str, str] = {}
@@ -426,18 +920,142 @@ class LibraryOrganizer:
         return None
 
     def _load_state(self) -> dict:
-        if self._state_path.exists():
-            try:
-                return json.loads(self._state_path.read_text(encoding="utf-8"))
-            except Exception:
-                pass
-        return {}
+        return _read_json_object(self._state_path) or {}
 
     def _save_state(self):
-        try:
-            self._state_path.write_text(json.dumps(self._state, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.warning(f"Could not save state: {e}")
+        with self._state_lock:
+            if self._pending_mutations >= _PERSIST_BATCH_MUTATIONS:
+                if self._persistence_timer is not None:
+                    self._persistence_timer.cancel()
+                    self._persistence_timer = None
+                state_ok = self._flush_state_locked()
+                if state_ok:
+                    self._pending_mutations = 0
+                if (
+                    not state_ok
+                    or self._pending_state_updates
+                    or self._identity_cache_is_dirty()
+                ):
+                    self._schedule_persistence_locked()
+            else:
+                self._schedule_persistence_locked()
+
+    def _schedule_persistence_locked(self):
+        if self._persistence_timer is not None:
+            return
+        timer = threading.Timer(_PERSIST_DELAY_SECONDS, self._flush_persistence_from_timer)
+        # A short non-daemon debounce guarantees the final partial batch is
+        # persisted before a one-job backend process exits normally.
+        timer.daemon = False
+        self._persistence_timer = timer
+        timer.start()
+
+    def _flush_persistence_from_timer(self):
+        with self._state_lock:
+            self._persistence_timer = None
+            self._flush_persistence_locked()
+
+    def _flush_persistence_locked(self) -> bool:
+        state_ok = self._flush_state_locked()
+        identity_ok = self._flush_identity_cache_locked()
+        if state_ok:
+            self._pending_mutations = 0
+        return state_ok and identity_ok
+
+    def _flush_state_locked(self) -> bool:
+        if not self._pending_state_updates:
+            return True
+        updates = dict(self._pending_state_updates)
+        lock_path = self._state_path.with_name(f"{self._state_path.name}.lock")
+        with _exclusive_file_lock(lock_path) as acquired:
+            if not acquired:
+                return False
+            disk_state = _read_json_object(self._state_path) or {}
+            disk_state.update(updates)
+            if not _atomic_replace_json(self._state_path, disk_state):
+                return False
+        for key, value in updates.items():
+            if self._pending_state_updates.get(key) == value:
+                self._pending_state_updates.pop(key, None)
+        self._state = {**disk_state, **self._pending_state_updates}
+        return True
+
+    def _identity_cache_is_dirty(self) -> bool:
+        return bool(
+            self._identity_force_rewrite
+            or self._identity_pending_upserts
+            or self._identity_pending_deletions
+        )
+
+    @staticmethod
+    def _same_record_fingerprint(
+        first: dict[str, Any],
+        second: dict[str, Any],
+    ) -> bool:
+        return (
+            first.get("size") == second.get("size")
+            and first.get("mtime_ns") == second.get("mtime_ns")
+            and first.get("device") == second.get("device")
+            and first.get("inode") == second.get("inode")
+        )
+
+    def _flush_identity_cache_locked(self) -> bool:
+        if not self._identity_cache_is_dirty():
+            return True
+        pending_upserts = dict(self._identity_pending_upserts)
+        pending_deletions = dict(self._identity_pending_deletions)
+        force_rewrite = self._identity_force_rewrite
+        lock_path = self._identity_cache_path.with_name(
+            f"{self._identity_cache_path.name}.lock"
+        )
+        with _exclusive_file_lock(lock_path) as acquired:
+            if not acquired:
+                return False
+            disk_payload = _read_json_object(self._identity_cache_path)
+            disk_valid, disk_records, disk_complete = self._validate_identity_cache_payload(
+                disk_payload
+            )
+            if disk_valid and (not force_rewrite or disk_complete):
+                merged_records = disk_records
+            else:
+                merged_records = dict(self._identity_records)
+
+            for path_key, expected_record in pending_deletions.items():
+                current_record = merged_records.get(path_key)
+                if (
+                    current_record is not None
+                    and self._same_record_fingerprint(current_record, expected_record)
+                ):
+                    merged_records.pop(path_key, None)
+            for path_key, record in pending_upserts.items():
+                try:
+                    current_stat = Path(record["path"]).stat()
+                except OSError:
+                    continue
+                if self._record_matches_stat(record, current_stat):
+                    merged_records[path_key] = record
+
+            complete = self._identity_cache_complete
+            if disk_valid and not force_rewrite:
+                complete = complete and disk_complete
+            payload = {
+                "schema_version": IDENTITY_INDEX_SCHEMA_VERSION,
+                "root": self._normalized_path(self.root),
+                "complete": complete,
+                "generated_ns": time.time_ns(),
+                "records": merged_records,
+            }
+            if not _atomic_replace_json(self._identity_cache_path, payload):
+                return False
+
+        for path_key, record in pending_upserts.items():
+            if self._identity_pending_upserts.get(path_key) == record:
+                self._identity_pending_upserts.pop(path_key, None)
+        for path_key, record in pending_deletions.items():
+            if self._identity_pending_deletions.get(path_key) == record:
+                self._identity_pending_deletions.pop(path_key, None)
+        self._identity_force_rewrite = False
+        return True
 
     # ── File scan helpers ─────────────────────────────────────────────────
 
@@ -458,11 +1076,7 @@ class LibraryOrganizer:
         distinct covers with the same title, and title-only filename templates
         render those tracks to the same stem.
         """
-        try:
-            existing_keys = set(self._extract_identity_keys_from_file(path))
-        except Exception as e:
-            logger.debug(f"Could not inspect existing file identity for {path}: {e}")
-            return False
+        existing_keys = set(self._identity_keys_for_path(path))
         return bool(existing_keys.intersection(self._track_identity_keys(track)))
 
     def _extract_flac_identity_keys(self, path: Path) -> list[str]:

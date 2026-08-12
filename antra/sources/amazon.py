@@ -380,6 +380,7 @@ class AmazonAdapter(BaseSourceAdapter):
         direct_creds_json: str = "",
         mirror_api_key: str = "",
         preferred_output_format: str = "source",
+        odesli_enricher: Optional[OdesliEnricher] = None,
     ):
         self._session = requests.Session()
         self._session.headers.update({
@@ -388,7 +389,7 @@ class AmazonAdapter(BaseSourceAdapter):
         # Inject API key for self-hosted mirror servers
         if mirror_api_key:
             self._session.headers["X-API-Key"] = mirror_api_key
-        self._odesli = OdesliEnricher(api_key=api_key)
+        self._odesli = odesli_enricher or OdesliEnricher(api_key=api_key)
         self.priority = 2  # Shared free-lossless tier with Apple/HiFi
         self._preferred_output_format = (preferred_output_format or "source").lower()
         self._prefer_lossy_download = self._preferred_output_format in {"mp3", "aac", "m4a"}
@@ -1074,9 +1075,7 @@ class AmazonAdapter(BaseSourceAdapter):
         try:
             with self._session.get(download_url, stream=True, timeout=60) as r:
                 r.raise_for_status()
-                with open(temp_enc_path, "wb") as f:
-                    for chunk in r.iter_content(65536):
-                        f.write(chunk)
+                self.write_stream_to_file(r, temp_enc_path, 65536)
 
             codec, duration_seconds = self._probe_audio_stream(temp_enc_path)
             if codec:

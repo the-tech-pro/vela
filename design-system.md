@@ -111,6 +111,14 @@ Light appearance uses warm-neutral white content, a slightly cooler translucent 
 
 Do not introduce provider-branded themes. Provider identity belongs in small logos, labels, and metadata only.
 
+The versioned appearance model also exposes UI scale from 85–125%, Compact /
+Comfortable / Spacious density, sidebar width from 210–300px, artwork size from
+130–210px, and System / Reduced / Full motion. The Go migration layer is the
+authoritative validator and defaults to 100%, Comfortable, 240px, 170px, and
+System. Frontend controls must use these persisted values through centralized
+custom properties/data attributes and must not create per-element inline
+dimensions.
+
 ### 3.4 Spacing
 
 Use a 4px base unit:
@@ -156,7 +164,7 @@ Default borders are 1px. Use stronger borders for focus, selection, or invalid s
 
 The window is a full-height split-view shell inspired by Apple desktop applications:
 
-- Sidebar: 228–252px, persistent on desktop, containing grouped navigation. Appearance belongs in Settings, not the sidebar.
+- Sidebar: 228–252px, persistent on desktop, containing grouped navigation plus Downloads and Settings actions. Appearance belongs in Settings, not the sidebar.
 - Toolbar: contextual title, search or page actions, visually part of the content column.
 - Main content: one artwork-led, task-focused page at a time.
 - Optional bottom player: persistent only while a local track is loaded.
@@ -207,7 +215,7 @@ Minimum target size is 36×36px; prefer 40×40px for icon-only actions. Disabled
 
 ### 5.3 Tabs and segmented controls
 
-Primary navigation includes Library, Artists, Discover, Downloaded, Downloads, dynamic connected-iPod destinations, and Settings. Add Music is a short overlay launched from Downloads; History is integrated into Downloads. Service/source selectors use compact segmented controls or chips.
+Primary navigation includes Library destinations, Downloads, dynamic connected-iPod destinations, and Settings. Add Music is a short overlay launched from Downloads; History is integrated into Downloads. Service/source selectors use compact segmented controls or chips.
 
 - Selected state uses accent surface, stronger text, and `aria-current` or `aria-selected`.
 - Keyboard arrow navigation is required for true tablists.
@@ -247,7 +255,7 @@ A track row should reserve stable areas for:
 4. Status/progress.
 5. Contextual action.
 
-Do not move row content as status changes. Determinate progress uses a bar and percentage when credible; indeterminate resolving/tagging states use a labeled activity indicator. “Processing” must not show fabricated percentages.
+Do not move row content as status changes. Determinate progress uses measured transfer bytes or provider duration telemetry and shows a bar and percentage only when credible. Unknown-size downloads, resolving, converting, tagging, and organizing use labeled indeterminate activity. Never synthesize progress from elapsed time or random increments.
 
 ### 5.7 Modals and overlays
 
@@ -284,7 +292,7 @@ Downloads is the activity surface. Its Add custom action opens a compact link-an
 
 ### 6.2 Failed downloads
 
-Failures live in a dedicated, collapsible section after the active tracklist. Each entry contains the failure reason, Retry, and Dismiss. Retry All is prominent only when more than one retryable item exists.
+Transient and no-match failures remain in the active tracklist as Retry scheduled, with the next attempt and remaining retry window. Backoff never occupies a download worker. Authentication, unsupported-content, cancellation, and storage errors become final immediately; other failures become final after the five-minute retry window. Final failures remain available with their plain-language reason and log details, without manual Retry controls that launch a separate backend process.
 
 ### 6.3 Connected accounts
 
@@ -346,6 +354,10 @@ The player preserves title, artist, release context, playback controls, seek, ti
 
 - Settings use a centered, paged overlay above the current page; opening a
   contextual cog selects the relevant settings page. Only the active page may scroll.
+- Appearance is a dedicated settings page. General owns startup destination,
+  remember-last-page, open-Downloads-on-add, completion/device notifications,
+  player volume, and completed-history retention. The player consumes the same
+  persisted volume value.
 - Downloads owns the Add custom link overlay. Audio format and resolver source
   controls live on their settings page.
 - Discover uses search as its primary top control. Storefront and genre are
@@ -400,6 +412,10 @@ These are baseline observations, not authorization for an unbounded redesign. Ea
   scrolls independently. Completed progress bars disappear. Active rows use a
   rotating circular progress icon; waiting rows use a clock; completed rows use
   a tick.
+- Download activity states the measured active/configured/device-ceiling worker
+  counts and separates resolving, transferring, and processing pipelines. A
+  higher worker setting must never imply that every worker is simultaneously
+  receiving network bytes.
 - Clean logs are collapsed by default behind Show more and use a subdued mono
   surface. Raw terminal framing and noisy provider bootstrap output are not
   shown.
@@ -448,6 +464,10 @@ These are baseline observations, not authorization for an unbounded redesign. Ea
 - Animated Lucide loaders rotate through a dedicated wrapper element rather
   than transforming the component SVG directly, ensuring motion survives
   Svelte style scoping and WebView2 SVG transform differences.
+- Primary visible artwork loads eagerly at a display-appropriate resolution;
+  below-the-fold artwork loads lazily. Navigation preserves stable keyed image
+  elements and source-specific error recovery so cached/decoded covers are
+  reused instead of remounted or permanently replaced after a transient error.
 - Queued-job actions are compact icon buttons for move up, run now, and remove.
   The text row distinguishes Waiting from Paused without adding a second queue
   surface.

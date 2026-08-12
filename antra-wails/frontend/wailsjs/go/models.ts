@@ -1,6 +1,42 @@
 export namespace main {
-	
+
+	export class UIConfig {
+	    scale: number;
+	    density: string;
+	    sidebar_width: number;
+	    artwork_size: number;
+	    motion: string;
+	    player_volume: number;
+	    startup_destination: string;
+	    remember_last_page: boolean;
+	    open_downloads_on_add: boolean;
+	    completion_notifications: boolean;
+	    device_notifications: boolean;
+	    completed_history_retention: number;
+
+	    static createFrom(source: any = {}) {
+	        return new UIConfig(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.scale = source["scale"];
+	        this.density = source["density"];
+	        this.sidebar_width = source["sidebar_width"];
+	        this.artwork_size = source["artwork_size"];
+	        this.motion = source["motion"];
+	        this.player_volume = source["player_volume"];
+	        this.startup_destination = source["startup_destination"];
+	        this.remember_last_page = source["remember_last_page"];
+	        this.open_downloads_on_add = source["open_downloads_on_add"];
+	        this.completion_notifications = source["completion_notifications"];
+	        this.device_notifications = source["device_notifications"];
+	        this.completed_history_retention = source["completed_history_retention"];
+	    }
+	}
 	export class Config {
+	    config_schema_version: number;
+	    ui?: UIConfig;
 	    download_path: string;
 	    download_path_is_library_root?: boolean;
 	    apple_enabled: boolean;
@@ -62,13 +98,15 @@ export namespace main {
 	    auto_sync_minute: number;
 	    auto_sync_days: number;
 	    tracked_playlists?: any[];
-	
+
 	    static createFrom(source: any = {}) {
 	        return new Config(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.config_schema_version = source["config_schema_version"];
+	        this.ui = this.convertValues(source["ui"], UIConfig);
 	        this.download_path = source["download_path"];
 	        this.download_path_is_library_root = source["download_path_is_library_root"];
 	        this.apple_enabled = source["apple_enabled"];
@@ -131,6 +169,24 @@ export namespace main {
 	        this.auto_sync_days = source["auto_sync_days"];
 	        this.tracked_playlists = source["tracked_playlists"];
 	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
 	}
 	export class HistoryItem {
 	    date: string;
@@ -143,11 +199,12 @@ export namespace main {
 	    skipped: number;
 	    error?: string;
 	    sources: Record<string, number>;
-	
+	    completed_files?: string[];
+
 	    static createFrom(source: any = {}) {
 	        return new HistoryItem(source);
 	    }
-	
+
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.date = source["date"];
@@ -160,6 +217,361 @@ export namespace main {
 	        this.skipped = source["skipped"];
 	        this.error = source["error"];
 	        this.sources = source["sources"];
+	        this.completed_files = source["completed_files"];
+	    }
+	}
+	export class IPodBackupDeleteRequest {
+	    archive_id: string;
+	    snapshot_id: string;
+	    confirmed: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodBackupDeleteRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.archive_id = source["archive_id"];
+	        this.snapshot_id = source["snapshot_id"];
+	        this.confirmed = source["confirmed"];
+	    }
+	}
+	export class IPodBackupExportRequest {
+	    archive_id: string;
+	    snapshot_id: string;
+	    destination_dir: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodBackupExportRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.archive_id = source["archive_id"];
+	        this.snapshot_id = source["snapshot_id"];
+	        this.destination_dir = source["destination_dir"];
+	    }
+	}
+	export class IPodBackupNoteRequest {
+	    archive_id: string;
+	    snapshot_id: string;
+	    note: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodBackupNoteRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.archive_id = source["archive_id"];
+	        this.snapshot_id = source["snapshot_id"];
+	        this.note = source["note"];
+	    }
+	}
+	export class IPodBackupSnapshotRequest {
+	    archive_id: string;
+	    snapshot_id: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodBackupSnapshotRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.archive_id = source["archive_id"];
+	        this.snapshot_id = source["snapshot_id"];
+	    }
+	}
+	export class IPodBackupSnapshotsRequest {
+	    archive_id: string;
+	    page: number;
+	    page_size: number;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodBackupSnapshotsRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.archive_id = source["archive_id"];
+	        this.page = source["page"];
+	        this.page_size = source["page_size"];
+	    }
+	}
+	export class IPodBackupVerifyRequest {
+	    archive_id: string;
+	    snapshot_id: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodBackupVerifyRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.archive_id = source["archive_id"];
+	        this.snapshot_id = source["snapshot_id"];
+	    }
+	}
+	export class IPodBrowseRequest {
+	    mount_path: string;
+	    resource: string;
+	    page: number;
+	    page_size: number;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodBrowseRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.mount_path = source["mount_path"];
+	        this.resource = source["resource"];
+	        this.page = source["page"];
+	        this.page_size = source["page_size"];
+	    }
+	}
+	export class IPodCapacityUnlockAdvanceRequest {
+	    session_id: string;
+	    action: string;
+	    confirmed: boolean;
+	    data?: Record<string, any>;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodCapacityUnlockAdvanceRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.session_id = source["session_id"];
+	        this.action = source["action"];
+	        this.confirmed = source["confirmed"];
+	        this.data = source["data"];
+	    }
+	}
+	export class IPodCapacityUnlockEligibilityRequest {
+	    mount_path: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodCapacityUnlockEligibilityRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.mount_path = source["mount_path"];
+	    }
+	}
+	export class IPodCapacityUnlockStartRequest {
+	    mount_path: string;
+	    confirmed: boolean;
+	    acknowledgements?: Record<string, boolean>;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodCapacityUnlockStartRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.mount_path = source["mount_path"];
+	        this.confirmed = source["confirmed"];
+	        this.acknowledgements = source["acknowledgements"];
+	    }
+	}
+	export class IPodExecuteRequest {
+	    plan_id: string;
+	    confirmed: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodExecuteRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.plan_id = source["plan_id"];
+	        this.confirmed = source["confirmed"];
+	    }
+	}
+	export class IPodManualBackupRequest {
+	    mount_path: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodManualBackupRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.mount_path = source["mount_path"];
+	    }
+	}
+	export class IPodMigrationPreflightRequest {
+	    archive_id: string;
+	    snapshot_id: string;
+	    mount_path: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodMigrationPreflightRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.archive_id = source["archive_id"];
+	        this.snapshot_id = source["snapshot_id"];
+	        this.mount_path = source["mount_path"];
+	    }
+	}
+	export class IPodMigrationRequest {
+	    migration_plan_id: string;
+	    confirmed: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodMigrationRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.migration_plan_id = source["migration_plan_id"];
+	        this.confirmed = source["confirmed"];
+	    }
+	}
+	export class IPodPlanDetailsRequest {
+	    plan_id: string;
+	    group: string;
+	    page: number;
+	    page_size: number;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodPlanDetailsRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.plan_id = source["plan_id"];
+	        this.group = source["group"];
+	        this.page = source["page"];
+	        this.page_size = source["page_size"];
+	    }
+	}
+	export class IPodPlanRequest {
+	    mount_path: string;
+	    source_files: string[];
+	    staging_id?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodPlanRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.mount_path = source["mount_path"];
+	        this.source_files = source["source_files"];
+	        this.staging_id = source["staging_id"];
+	    }
+	}
+	export class IPodRecoveryUSBDevice {
+	    vendor_id: string;
+	    product_id: string;
+	    mode: string;
+	    model_hint?: string;
+	    name?: string;
+	    instance_id?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodRecoveryUSBDevice(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.vendor_id = source["vendor_id"];
+	        this.product_id = source["product_id"];
+	        this.mode = source["mode"];
+	        this.model_hint = source["model_hint"];
+	        this.name = source["name"];
+	        this.instance_id = source["instance_id"];
+	    }
+	}
+	export class IPodRecoveryUSBInspection {
+	    supported: boolean;
+	    available: boolean;
+	    read_only: boolean;
+	    platform: string;
+	    devices: IPodRecoveryUSBDevice[];
+	    message?: string;
+	    error?: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodRecoveryUSBInspection(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.supported = source["supported"];
+	        this.available = source["available"];
+	        this.read_only = source["read_only"];
+	        this.platform = source["platform"];
+	        this.devices = this.convertValues(source["devices"], IPodRecoveryUSBDevice);
+	        this.message = source["message"];
+	        this.error = source["error"];
+	    }
+
+		convertValues(a: any, classs: any, asMap: boolean = false): any {
+		    if (!a) {
+		        return a;
+		    }
+		    if (a.slice && a.map) {
+		        return (a as any[]).map(elem => this.convertValues(elem, classs));
+		    } else if ("object" === typeof a) {
+		        if (asMap) {
+		            for (const key of Object.keys(a)) {
+		                a[key] = new classs(a[key]);
+		            }
+		            return a;
+		        }
+		        return new classs(a);
+		    }
+		    return a;
+		}
+	}
+	export class IPodRestorePreflightRequest {
+	    archive_id: string;
+	    snapshot_id: string;
+	    mount_path: string;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodRestorePreflightRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.archive_id = source["archive_id"];
+	        this.snapshot_id = source["snapshot_id"];
+	        this.mount_path = source["mount_path"];
+	    }
+	}
+	export class IPodRestoreRequest {
+	    restore_plan_id: string;
+	    confirmed: boolean;
+
+	    static createFrom(source: any = {}) {
+	        return new IPodRestoreRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.restore_plan_id = source["restore_plan_id"];
+	        this.confirmed = source["confirmed"];
+	    }
+	}
+	export class IPodStageRequest {
+	    mount_path: string;
+	    completed_files: string[];
+
+	    static createFrom(source: any = {}) {
+	        return new IPodStageRequest(source);
+	    }
+
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.mount_path = source["mount_path"];
+	        this.completed_files = source["completed_files"];
 	    }
 	}
 

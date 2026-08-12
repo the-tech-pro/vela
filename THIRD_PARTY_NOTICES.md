@@ -4,6 +4,8 @@
 
 Vela uses headless device, database, artwork, checksum, backup, and sync
 components from [iOpenPod](https://github.com/TheRealSavi/iOpenPod).
+This complete notice is bundled with the backend and exposed by the desktop
+About-readable `GetThirdPartyNotices` API.
 
 Copyright (c) John Gibbons and iOpenPod contributors.
 

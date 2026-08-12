@@ -96,6 +96,13 @@ class YouTubeAdapter(BaseSourceAdapter):
         os.makedirs(tmp_dir, exist_ok=True)
         tmp_stem = os.path.join(tmp_dir, f"_yt_tmp_{self._safe_stem(result.stream_id or result.title)}")
 
+        def progress_hook(status: dict) -> None:
+            if status.get("status") not in {"downloading", "finished"}:
+                return
+            downloaded = int(status.get("downloaded_bytes") or 0)
+            total = status.get("total_bytes") or status.get("total_bytes_estimate")
+            self.report_download_progress(downloaded, int(total) if total else None)
+
         options = {
             "format": "bestaudio[acodec!=none]/bestaudio/best",
             "outtmpl": tmp_stem + ".%(ext)s",
@@ -104,6 +111,7 @@ class YouTubeAdapter(BaseSourceAdapter):
             "noplaylist": True,
             "retries": 3,
             "nopart": True,
+            "progress_hooks": [progress_hook],
         }
 
         try:

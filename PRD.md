@@ -2,7 +2,7 @@
 
 **Document status:** Baseline inventory and overhaul foundation
 
-**Last updated:** 2026-08-11
+**Last updated:** 2026-08-12
 
 **Product owner:** Vela
 
@@ -180,13 +180,13 @@ Current non-P2P adapter code includes TIDAL, Qobuz, Apple Music, Amazon Music, D
 
 | ID | Requirement | Status |
 |---|---|---|
-| DL-001 | Show queued tracks and real-time per-track states and progress. | Implemented |
+| DL-001 | Show queued tracks and real-time per-track states. Show determinate transfer progress only from measured bytes/duration; use labeled indeterminate resolving and processing states otherwise. | Implemented |
 | DL-002 | Permit cancellation of the active download operation. | Implemented |
 | DL-003 | Collect failed tracks into a dedicated panel. | Implemented |
-| DL-004 | Permit retry of one failed track, sequential Retry All, and dismissal of failures. | Implemented |
+| DL-004 | Automatically requeue transient and no-match track failures with jittered backoff for up to five minutes without occupying a worker while waiting. Stop immediately on authentication, unsupported-content, cancellation, or storage errors; expose a final failure only after retry exhaustion. | Implemented |
 | DL-005 | Provide a verbose log panel without replacing the primary tracklist UI. | Implemented |
 | DL-006 | Run two concurrent workers for all legitimate paid builds, without checking a supporter key. | Implemented |
-| DL-007 | Expose a validated concurrent song-worker setting from 1–8, defaulting to two, and warn that excessive concurrency may trigger provider limits. | Implemented |
+| DL-007 | Expose a validated concurrent song-worker setting defaulting to two, with a hardware-derived ceiling of 8, 12, or 16. Retain provider-specific sub-limits and warn that higher concurrency may increase throttling, CPU, and disk contention rather than improve speed. | Implemented |
 | DL-008 | Represent a requested song, album, or playlist as one job in Downloads; integrate completed history there and show excess jobs as waiting. | Partially implemented; active and completed surfaces shipped, multi-job scheduler pending |
 | DL-009 | Show completed/total progress in both queue states, use semantic per-song state icons, remove completed-row progress bars, and pin overall progress to the queue's bottom edge. | Implemented |
 
@@ -236,6 +236,7 @@ Current non-P2P adapter code includes TIDAL, Qobuz, Apple Music, Amazon Music, D
 | PLAY-004 | Read embedded synced lyrics and highlight/scroll the active line during playback. | Implemented |
 | PLAY-005 | Display plain lyrics when synchronized timing is unavailable. | Implemented |
 | PLAY-006 | Save or refresh release cover art in the configured library. | Implemented |
+| PLAY-007 | Do not expose an online streaming, embedded playback, or external playback-launcher surface. | Implemented |
 
 ### 5.12 Removed audio analyzer
 
@@ -262,6 +263,7 @@ Current non-P2P adapter code includes TIDAL, Qobuz, Apple Music, Amazon Music, D
 | UI-005 | Use artwork-led cards, neutral layered surfaces, SF-style system typography, restrained motion, and a single music-red accent inspired by Apple Music without copying Apple trademarks or assets. | Implemented |
 | UI-006 | Use Lucide as the general UI icon system; a connected iPod uses the closest neutral portable-device glyph when no dedicated iPod glyph exists. | Implemented |
 | UI-007 | Settings use category pages, auto-save valid changes on change/blur, and display validation errors without a Save Changes button. | Implemented |
+| UI-008 | Persist appearance/general preferences in a versioned migrated config: System/Light/Dark, 85–125% scale, three densities, bounded sidebar/artwork sizing, motion policy, player volume, startup/page behavior, desktop notifications, and bounded history retention. | Implemented |
 
 ### 5.15 Podcasts
 
@@ -304,6 +306,7 @@ Removing supporter entitlement must not blindly remove mirror authentication or 
 - The UI must report unavailable sources and authorization failures without promising universal coverage.
 - Credentials must be supplied and used only for accounts and content the user is authorized to access.
 - The product must avoid claims that it bypasses subscriptions, DRM, regional licensing, or third-party controls.
+- Online playback is outside the product scope. YouTube Music links remain downloader inputs only where supported.
 
 ### 6.3 Current documentation discrepancies
 
@@ -432,18 +435,35 @@ device, database, artwork, checksum, backup, and sync modules are.
 |---|---|---|
 | IPOD-001 | Detect mounted iPod Classic, Mini, and Nano devices and show identity, capacity, firmware, filesystem, database, checksum, and media capabilities. | Implemented |
 | IPOD-001A | Run iOpenPod as an embedded headless library only; never launch its GUI or require a separate background application. Show a sidebar entry named for each detected device only while connected. | Implemented |
-| IPOD-002 | Read and browse device tracks, albums, artists, podcasts, playlists, ratings, play counts, skip counts, artwork, photos, and video metadata without modifying the device. | Planned |
-| IPOD-003 | Build a reviewable sync plan before any device write, covering additions, removals, metadata, artwork, playlists, transcoding, and storage impact. | Planned |
-| IPOD-004 | Create a recoverable device/database backup before applying a sync plan and expose restore. | Planned |
-| IPOD-005 | Sync Vela's local library to the iPod, preserving iTunesDB/SQLiteDB rules, generation-specific checksums, artwork formats, and safe file paths. | Planned |
+| IPOD-001B | On Windows, detect attached Mac-formatted HFS+ iPods through bounded raw read-only metadata inspection when the OS cannot mount them. Show a clear compatibility state and block browse, backup, restore, sync, eject, and capacity operations rather than treating the device as absent or writable. | Implemented; file access still requires macOS or a trusted HFS+ filesystem layer |
+| IPOD-002 | Read and browse device tracks, albums, artists, podcasts, playlists, ratings, play counts, skip counts, artwork, photos, and video metadata without modifying the device. | Implemented |
+| IPOD-003 | Build a reviewable sync plan before any device write, covering additions, removals, metadata, artwork, playlists, transcoding, and storage impact. | Implemented |
+| IPOD-004 | Create a recoverable device/database backup before applying a sync plan and expose offline inventory, notes, deep verification, export, retention, same-device restore, and interrupted-operation recovery. | Implemented; supervised hardware verification pending |
+| IPOD-005 | Sync Vela's local library to the iPod, preserving iTunesDB/SQLiteDB rules, generation-specific checksums, artwork formats, and safe file paths. | Safety-gated SyncEngine backend implemented; supervised hardware verification pending |
 | IPOD-006 | Transcode unsupported FLAC/OGG/video media to device-compatible formats with FFmpeg and an optional conversion cache. | Planned |
 | IPOD-007 | Create, edit, delete, and reorder standard and smart playlists; manage podcasts, photos, videos, and drag-and-drop additions. | Planned |
 | IPOD-008 | Import play counts, ratings, skips, and voice memos back to the local library where supported; scrobbling remains opt-in. | Planned |
-| IPOD-009 | Support safe eject, device diagnostics, Rockbox compatibility options, and explicit warnings for unsupported Shuffle and Touch models. | Planned |
+| IPOD-009 | Support safe eject, device diagnostics, Rockbox compatibility options, and explicit warnings for unsupported Shuffle and Touch models. | Safe eject, hardware gating, and guided Rockbox capacity workflow implemented; supervised hardware verification pending |
+| IPOD-010 | Restore a verified full regular-file snapshot only to the exact source identity, after a fresh verified host-side safety checkpoint, exact target revalidation, and a clearly marked non-cancellable commit/flush boundary. | Implemented; supervised hardware verification pending |
+| IPOD-011 | Migrate compatible media and library metadata to a separately initialized replacement iPod without copying source SysInfo or other identity material; rebuild target-specific databases, checksums, artwork, and playlists through a reviewed addition-only plan. | Implemented; supervised hardware verification pending |
+| IPOD-012 | Offer an experimental Windows-only Classic 6G/6.5G capacity-unlock workflow only after FAT32, stable identity, model/firmware, USB, writable-volume, and storage-health evidence pass. Require pinned artifacts, verified filesystem and SysCfg backups, byte-exact candidate/readback checks, manual NOR attestation, and user-controlled iTunes restore. | Implemented behind hardware release gate |
+| IPOD-013 | Persist restore, migration, and capacity-unlock operation state across restarts; reject cancellation after commit and prevent application shutdown while protected commit/flush work is active. | Implemented |
+
+For this contract, **full file restore** means the complete regular-file
+snapshot supported by iOpenPod. It does not contain a partition table, NOR,
+SysCfg, firmware, or a factory image. **Compatible-device migration** restores
+content while preserving the replacement iPod's hardware identity and
+rebuilding device-specific databases/checksums; it never raw-copies source
+identity files. **Capacity unlock** is a separate destructive maintenance
+workflow that changes a supported Classic 6G/6.5G SysCfg and then wipes the
+device during a manual restore of Apple's unmodified firmware 2.0.2.
 
 All device mutations require explicit user confirmation. Device discovery and
-browsing are read-only. Vela must never silently initialize, erase, format, or
-rewrite an attached device.
+browsing are read-only. Restore requires a verified host-side safety checkpoint
+and exact device revalidation. Vela must never silently initialize, erase,
+format, rewrite NOR, or launch/control a firmware restore. Hard NOR corruption
+can still require external hardware recovery; Vela does not claim factory
+support or a guaranteed unbrick path.
 
 ### Phase 1 — Baseline and entitlement simplification
 
@@ -504,14 +524,14 @@ rewrite an attached device.
 | QUEUE-001 | Treat every song, album, playlist, or custom link request as a persistent job. Adding a request must never replace or cancel the active job. | Implemented |
 | QUEUE-002 | Restore waiting work after restart. Completed files are validated/reused and incomplete work resumes without duplicating valid output. | Implemented |
 | QUEUE-003 | Pause stops the active backend process tree promptly, preserves completed songs, checkpoints the job as paused, and retries or resumes a provider-owned partial where supported. Queue cancellation requires themed confirmation. | Implemented |
-| QUEUE-004 | Apply worker-limit changes live from 1–8. Increasing starts additional work when available; decreasing lets in-flight tracks finish and gates subsequent starts. | Implemented |
+| QUEUE-004 | Apply worker-limit changes live from 1 to the device ceiling. Increasing starts additional work when available; decreasing lets in-flight tracks finish and gates subsequent starts. Show authoritative active/configured/ceiling and phase counts. | Implemented |
 | QUEUE-005 | The floating download controller remains compact, shows current artwork and overall progress, offers pause/resume/cancel, opens Downloads when clicked, and disappears when no active/waiting job remains. | Implemented |
 | QUEUE-006 | Downloads contains the current song list (bounded-height scrolling), waiting job queue, clean expandable log, and completed job history with functioning action menus. | Implemented |
 | QUEUE-007 | Waiting and paused jobs can be reordered, promoted to run immediately (checkpointing the former active job), or removed individually with confirmation. Queue state changes render before backend preparation begins. | Implemented |
 | LIB-INDEX-012 | Downloaded indexing weights metadata work by every detected song rather than every folder, emits explicit warning/error events, and never reports completion when the index cache could not be written. | Implemented |
 | LIB-INDEX-013 | Apple indexing yields resource priority to explicit downloads and resumes from its local checkpoints afterwards so background work cannot starve the download backend. | Implemented |
-| ART-001 | Artwork extraction cache identities include the complete normalized path plus file size and modification time; releases in the same parent folder must never collide. Embedded artwork and a cover sidecar are enabled by default. | Implemented |
-| LIB-INDEX-014 | Ignore playlist-folder resources returned alongside playlists. If an Apple-managed library playlist returns 404 for its library tracks relationship, resolve its `playParams.globalId` and retry through the documented storefront catalog tracks relationship without exposing the failed route as a job error. | Implemented |
+| ART-001 | Artwork extraction cache identities include the complete normalized path plus file size and modification time; releases in the same parent folder must never collide. Pre-warm embedded artwork during background indexing, request display-sized remote artwork, preserve decoded/cache reuse across navigation, and keep cover sidecars enabled by default. | Implemented |
+| LIB-INDEX-014 | Ignore playlist-folder resources returned alongside playlists. Load playlist tracks from Apple's library or catalog playlist resource and its included relationship, following API-provided catalog and pagination links instead of constructing a direct catalog `/tracks` route. Preserve known zero counts so valid empty playlists checkpoint successfully without a track request. | Implemented |
 | NAMING-001 | Default album track names use the track number only (`12 - Title`). Disc prefixes are opt-in so normal metadata cannot produce confusing names such as `1-12 - Title`. | Implemented |
 
 ## 15. Library information architecture

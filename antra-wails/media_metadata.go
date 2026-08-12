@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os/exec"
@@ -116,7 +117,12 @@ func resolveExe(exePath, name string) string {
 }
 
 func runFFProbe(filePath, ffprobeExe string) (map[string]interface{}, error) {
-	cmd := exec.Command(
+	return runFFProbeContext(context.Background(), filePath, ffprobeExe)
+}
+
+func runFFProbeContext(ctx context.Context, filePath, ffprobeExe string) (map[string]interface{}, error) {
+	cmd := exec.CommandContext(
+		ctx,
 		resolveExe(ffprobeExe, "ffprobe"),
 		"-v", "quiet",
 		"-print_format", "json",

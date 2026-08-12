@@ -51,6 +51,7 @@ class HifiAdapter(BaseSourceAdapter):
 
     name = "hifi"
     priority = 2  # Share priority 2 with Amazon/Apple for load balancing
+    max_concurrent_searches = 3
 
     def __init__(
         self,
@@ -651,10 +652,7 @@ class HifiAdapter(BaseSourceAdapter):
         """Download a single URL to a file."""
         with self._session.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(65536):
-                    if chunk:
-                        f.write(chunk)
+            self.write_stream_to_file(r, path, 65536)
 
     def _download_segments(
         self, urls: list[str], output_base: str, ext: str

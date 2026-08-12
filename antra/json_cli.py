@@ -12,6 +12,12 @@ import time
 from dataclasses import asdict
 from typing import Optional
 
+from antra.utils.perf import log_payload, log_phase, start_phase
+
+
+_BACKEND_PROCESS_STARTED = start_phase()
+
+
 # On Windows, Python's subprocess module defaults to the system locale encoding
 # (usually cp1252) for text-mode pipes. yt-dlp spawns ffmpeg internally and
 # reads its stderr in text mode without specifying encoding, which causes
@@ -31,8 +37,12 @@ if sys.platform == 'win32':
 from antra.core.models import BulkDownloadProgress
 from antra.core.service import AntraService, RuntimeOptions
 from antra.core.events import EngineEvent
+from antra.core.completed_files import completed_library_files, validated_library_file
 from antra.utils.runtime import ensure_runtime_environment
 from antra.core.models import TrackMetadata
+
+
+logger = logging.getLogger(__name__)
 
 
 # ── Mutagen probe fallback ────────────────────────────────────────────────────
@@ -182,13 +192,16 @@ def setup_json_logging(level=logging.INFO):
     handler = JsonLogHandler()
     logger.addHandler(handler)
 
-def emit_event(event: EngineEvent):
+def emit_event(event: EngineEvent, library_root: str = ""):
     track_payload = None
     if event.track:
         track_payload = asdict(event.track)
         track_payload.pop("lyrics", None)
         track_payload.pop("synced_lyrics", None)
 
+    final_file_path = None
+    if event.type.value == "track_completed":
+        final_file_path = validated_library_file(event.file_path, library_root)
     data = {
         "type": "event",
         "name": event.type.value,
@@ -203,6 +216,19 @@ def emit_event(event: EngineEvent):
             "quality_label": event.quality_label,
             "attempt": event.attempt,
             "track_data": track_payload,
+            "job_id": event.job_id,
+            "track_id": event.track_id,
+            "phase": event.phase,
+            "bytes_downloaded": event.bytes_downloaded,
+            "bytes_total": event.bytes_total,
+            "progress_percent": event.progress_percent,
+            "speed_bps": event.speed_bps,
+            "active_workers": event.active_workers,
+            "configured_workers": event.configured_workers,
+            "worker_ceiling": event.worker_ceiling,
+            "retry_after_seconds": event.retry_after_seconds,
+            "retry_deadline": event.retry_deadline,
+            "final_file_path": final_file_path,
         }
     }
     print(json.dumps(data), flush=True)
@@ -273,18 +299,12 @@ def _format_track_release_date(tracks) -> str:
     return str(year) if year else ''
 
 
-def _track_from_payload(payload: dict) -> TrackMetadata:
-    payload = dict(payload or {})
-    payload["artists"] = list(payload.get("artists") or [])
-    payload["audio_traits"] = list(payload.get("audio_traits") or [])
-    payload["genres"] = list(payload.get("genres") or [])
-    payload["album_artists"] = list(payload.get("album_artists") or [])
-    return TrackMetadata(**payload)
-
-
-def _emit(obj: dict):
+def _emit(obj: dict, perf_name: str = ""):
     """Print a JSON event line to stdout (picked up by the Go process)."""
-    print(json.dumps(obj), flush=True)
+    encoded = json.dumps(obj)
+    if perf_name:
+        log_payload(logger, perf_name, encoded)
+    print(encoded, flush=True)
 
 
 def _wrap_tidal_session_payload(payload: dict) -> dict:
@@ -2234,7 +2254,9 @@ def _run_auto_sync(cfg) -> None:
         }), flush=True)
         return
 
+    service_started = start_phase()
     service = AntraService(cfg)
+    log_phase(logger, "service initialization", service_started)
     options = RuntimeOptions(
         output_dir=cfg.output_dir,
         output_format=cfg.output_format,
@@ -2317,28 +2339,43 @@ def _persist_tracked_playlists(tracked: list) -> None:
         with open(config_path, "r", encoding="utf-8") as f:
             data = _json.load(f)
         data["tracked_playlists"] = tracked
-        with open(config_path, "w", encoding="utf-8") as f:
-            _json.dump(data, f, ensure_ascii=False, indent=2)
+        config_dir = os.path.dirname(os.path.abspath(config_path))
+        fd, temp_path = tempfile.mkstemp(prefix="config-", suffix=".tmp", dir=config_dir)
+        try:
+            os.chmod(temp_path, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                fd = -1
+                _json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp_path, config_path)
+            os.chmod(config_path, 0o600)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
     except Exception as e:
         logger.warning("Could not persist tracked_playlists to config: %s", e)
 
 
 def main():
 
-    _start_time = time.time()
     parser = argparse.ArgumentParser(description="Antra JSON backend")
     parser.add_argument("playlists", nargs="*", help="Spotify URLs to download")
     parser.add_argument("--config", help="Path to config.json from Go launcher")
     parser.add_argument("--get-ffmpeg-dir", action="store_true",
                         help="Print the paths to bundled ffmpeg/ffprobe (two lines) and exit")
+    parser.add_argument("--read-only-helper", action="store_true",
+                        help="Serve read-only newline-delimited JSON requests until stdin closes")
     parser.add_argument("--discography", metavar="ARTIST_URL",
                         help="Fetch artist discography info as JSON and exit")
     parser.add_argument("--search-artists", metavar="QUERY",
                         help="Search for artists by name and return scored results as JSON, then exit")
     parser.add_argument("--search-source", default="spotify", choices=["spotify", "apple"],
                         help="Source to use for artist search (default: spotify)")
-    parser.add_argument("--retry-track-json", metavar="TRACK_JSON",
-                        help="Retry a single previously failed track from serialized track metadata")
     parser.add_argument("--discovery-json", action="store_true",
                         help="Fetch discovery data (Top Albums/Playlists) and exit")
     parser.add_argument("--discovery-region", default="us",
@@ -2370,12 +2407,22 @@ def main():
     parser.add_argument("--apple-library-artist", default="",
                         help="Read one artist's songs from the local Apple Music index")
     parser.add_argument("--ipod-devices", action="store_true",
-                        help="Scan mounted iPods using the iOpenPod engine and exit")
+                        help="Deprecated alias for the read-only iPod scan operation")
     parser.add_argument("--auto-sync", action="store_true",
                         help="Run auto-sync: download new tracks from all tracked playlists, then exit")
+    from antra.core.ipod_cli import add_ipod_arguments
+    add_ipod_arguments(parser)
     args = parser.parse_args()
 
     ensure_runtime_environment()
+
+    if args.read_only_helper:
+        from antra.core.read_only_helper import serve_read_only_helper
+        sys.exit(serve_read_only_helper(args.config))
+
+    if args.ipod_operation:
+        from antra.core.ipod_cli import run_ipod_command
+        sys.exit(run_ipod_command(args))
 
     if args.discography:
         url = args.discography
@@ -2453,6 +2500,8 @@ def main():
         print(ffprobe or "")
         sys.exit(0)
     setup_json_logging()
+    log_phase(logger, "backend startup", _BACKEND_PROCESS_STARTED)
+    config_started = start_phase()
 
     # If config file is provided, load environments to os.environ so load_config picks them up
     if args.config and os.path.exists(args.config):
@@ -2471,7 +2520,16 @@ def main():
                     configured_root = legacy_root if os.path.isdir(legacy_root) else os.path.join(configured_root, "Vela")
                 os.environ["OUTPUT_DIR"] = configured_root
             if "max_concurrent_jobs" in settings:
-                os.environ["ANTRA_MAX_WORKERS"] = str(max(1, min(8, int(settings["max_concurrent_jobs"] or 2))))
+                logical_cpus = os.cpu_count() or 4
+                adaptive_ceiling = 8 if logical_cpus <= 4 else 12 if logical_cpus <= 8 else 16
+                worker_ceiling = max(
+                    8,
+                    min(16, int(os.environ.get("ANTRA_WORKER_CEILING", adaptive_ceiling))),
+                )
+                os.environ["ANTRA_WORKER_CEILING"] = str(worker_ceiling)
+                os.environ["ANTRA_MAX_WORKERS"] = str(
+                    max(1, min(worker_ceiling, int(settings["max_concurrent_jobs"] or 2)))
+                )
             if settings.get("spotify_sp_dc"):
                 os.environ["SPOTIFY_SP_DC"] = settings["spotify_sp_dc"]
             # Map other possible API keys if configured in the Go app
@@ -2615,6 +2673,7 @@ def main():
     from antra.core.config import load_config
     from antra.utils.organizer import LibraryOrganizer
     cfg = load_config()
+    log_phase(logger, "config load", config_started)
 
     if args.tidal_validate:
         print(json.dumps(_validate_tidal_auth(cfg)), flush=True)
@@ -2637,6 +2696,8 @@ def main():
         sys.exit(0)
 
     if args.apple_library or args.apple_library_refresh or args.apple_library_index:
+        apple_library_started = start_phase()
+        client = None
         try:
             authorization = (cfg.apple_authorization_token or "").strip()
             music_user_token = (cfg.apple_music_user_token or "").strip()
@@ -2662,15 +2723,24 @@ def main():
                     force_refresh_summary=True,
                 )
                 event_type = "apple_index_complete" if data.get("complete") else "apple_index_incomplete"
-                print(json.dumps({"type": event_type, "data": data}), flush=True)
+                payload = {"type": event_type, "data": data}
+                log_phase(logger, "apple library index", apple_library_started)
+                _emit(payload, perf_name=event_type)
             else:
                 data = client.get_library(force_refresh=args.apple_library_refresh)
-                print(json.dumps({"type": "apple_library", "data": data}), flush=True)
+                payload = {"type": "apple_library", "data": data}
+                log_phase(logger, "apple library", apple_library_started)
+                _emit(payload, perf_name="apple_library")
         except Exception as e:
             print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+        finally:
+            if client is not None:
+                client.close()
         sys.exit(0)
 
     if args.apple_library_detail:
+        apple_detail_started = start_phase()
+        client = None
         try:
             authorization = (cfg.apple_authorization_token or "").strip()
             music_user_token = (cfg.apple_music_user_token or "").strip()
@@ -2686,12 +2756,19 @@ def main():
                 if args.config else None,
             )
             data = client.get_playlist_detail(args.apple_library_detail)
-            print(json.dumps({"type": "apple_library_detail", "data": data}), flush=True)
+            payload = {"type": "apple_library_detail", "data": data}
+            log_phase(logger, "apple library detail", apple_detail_started)
+            _emit(payload, perf_name="apple_library_detail")
         except Exception as e:
             print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+        finally:
+            if client is not None:
+                client.close()
         sys.exit(0)
 
     if args.apple_library_artist:
+        apple_artist_started = start_phase()
+        client = None
         try:
             from antra.core.apple_library import AppleLibraryClient
             client = AppleLibraryClient(
@@ -2700,35 +2777,25 @@ def main():
                 (cfg.apple_storefront or "gb").strip() or "gb",
                 cache_path=os.path.join(os.path.dirname(os.path.abspath(args.config)), "apple_library_cache.sqlite3") if args.config else None,
             )
-            print(json.dumps({"type": "apple_library_detail", "data": client.get_artist_detail(args.apple_library_artist)}), flush=True)
+            payload = {
+                "type": "apple_library_detail",
+                "data": client.get_artist_detail(args.apple_library_artist),
+            }
+            log_phase(logger, "apple artist detail", apple_artist_started)
+            _emit(payload, perf_name="apple_artist_detail")
         except Exception as e:
             print(json.dumps({"type": "error", "message": str(e)}), flush=True)
+        finally:
+            if client is not None:
+                client.close()
         sys.exit(0)
 
     if args.ipod_devices:
         try:
-            from iopenpod.device.scanner import scan_for_ipods
-
-            devices = []
-            for device in scan_for_ipods():
-                devices.append({
-                    "path": device.path,
-                    "name": device.ipod_name or device.display_name or "iPod",
-                    "model_family": device.model_family or "iPod",
-                    "generation": device.generation or "",
-                    "model_number": device.model_number or "",
-                    "capacity": device.capacity or "",
-                    "disk_size_gb": device.disk_size_gb,
-                    "free_space_gb": device.free_space_gb,
-                    "firmware": device.firmware or "",
-                    "filesystem_type": device.filesystem_type or "",
-                    "checksum_type": device.checksum_type or "",
-                    "audio_codecs": list(device.audio_codecs or []),
-                    "podcasts_supported": bool(device.podcasts_supported),
-                    "voice_memos_supported": bool(device.voice_memos_supported),
-                    "uses_sqlite_db": bool(device.uses_sqlite_db),
-                })
-            print(json.dumps({"type": "ipod_devices", "data": {"devices": devices}}), flush=True)
+            from antra.core.ipod_service import IPodService
+            app_data = os.path.dirname(os.path.abspath(args.config)) if args.config else os.getcwd()
+            result = IPodService(app_data).scan()
+            print(json.dumps({"type": "ipod_devices", "data": result}), flush=True)
         except ImportError:
             print(json.dumps({
                 "type": "error",
@@ -2747,55 +2814,14 @@ def main():
 
     print(json.dumps({"type": "log", "level": "info", "message": f"[Config] Filename format: {cfg.filename_format} | Album layout: {getattr(cfg, 'album_folder_structure', cfg.folder_structure)} | Playlist layout: {getattr(cfg, 'playlist_folder_structure', cfg.folder_structure)} | Single layout: {getattr(cfg, 'single_track_structure', 'album_numbered')} | Output format: {cfg.output_format}"}))
 
+    service_started = start_phase()
     service = AntraService(cfg)
+    log_phase(logger, "service initialization", service_started)
     options = RuntimeOptions(
         output_dir=cfg.output_dir,
         source_preference=cfg.source_preference,
         output_format=cfg.output_format
     )
-
-    if args.retry_track_json:
-        try:
-            organizer = LibraryOrganizer(
-                cfg.output_dir,
-                full_albums=getattr(cfg, "library_mode", "smart_dedup") == "full_albums",
-                folder_structure=getattr(cfg, "folder_structure", "standard"),
-                album_folder_structure=getattr(cfg, "album_folder_structure", getattr(cfg, "folder_structure", "standard")),
-                playlist_folder_structure=getattr(cfg, "playlist_folder_structure", getattr(cfg, "folder_structure", "standard")),
-                single_track_structure=getattr(cfg, "single_track_structure", "album_numbered"),
-                filename_format=getattr(cfg, "filename_format", "default"),
-                single_track_filename_template=getattr(cfg, "single_track_filename_template", ""),
-                album_track_filename_template=getattr(cfg, "album_track_filename_template", ""),
-                folder_structure_template=getattr(cfg, "folder_structure_template", ""),
-                multi_disc_handling=getattr(cfg, "multi_disc_handling", "prefix"),
-                track_number_padding=getattr(cfg, "track_number_padding", 2),
-                illegal_character_replacement=getattr(cfg, "illegal_character_replacement", ""),
-                whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
-                filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
-            )
-        except Exception as e:
-            print(json.dumps({"type": "log", "level": "error", "message": f"Cannot access output directory: {e}"}))
-            print(json.dumps({"type": "done"}))
-            return
-
-        try:
-            track = _track_from_payload(json.loads(args.retry_track_json))
-            print(json.dumps({
-                "type": "log",
-                "level": "info",
-                "message": f"Retrying failed track: {track.artist_string} - {track.title}",
-            }), flush=True)
-            service.download_tracks(
-                [track],
-                options=options,
-                event_callback=emit_event,
-                organizer=organizer,
-            )
-        except Exception as e:
-            print(json.dumps({"type": "log", "level": "error", "message": str(e)}), flush=True)
-
-        print(json.dumps({"type": "done"}), flush=True)
-        return
 
     if not args.playlists:
         print(json.dumps({"type": "log", "level": "error", "message": "No playlists provided"}))
@@ -2806,6 +2832,7 @@ def main():
     # Build the organizer once — it scans the entire library on init, which can
     # be very slow on a NAS. Reusing one instance across all URLs in this batch
     # means the scan happens exactly once per run, not once per URL.
+    organizer_started = start_phase()
     try:
         organizer = LibraryOrganizer(
             cfg.output_dir,
@@ -2824,6 +2851,7 @@ def main():
             whitespace_handling=getattr(cfg, "whitespace_handling", "preserve"),
             filename_conflict_behavior=getattr(cfg, "filename_conflict_behavior", "skip"),
         )
+        log_phase(logger, "library organizer", organizer_started)
     except Exception as e:
         print(json.dumps({"type": "log", "level": "error", "message": f"Cannot access output directory: {e}"}))
         print(json.dumps({"type": "done"}))
@@ -2864,6 +2892,7 @@ def main():
         try:
             _emit({"type": "job_preparing", "stage": "metadata", "message": "Reading album, playlist, and song information…"})
             print(json.dumps({"type": "log", "level": "info", "message": f"Syncing playlist to library: {url}"}))
+            metadata_started = start_phase()
             # Progressive page callback — fires after each 1000-track GraphQL page.
             # First call emits playlist_loaded (partial), subsequent calls emit tracks_appended.
             _page_state = {"sent": 0}
@@ -2888,7 +2917,7 @@ def main():
                         or getattr(tracks_so_far[0], "album", None)
                         or ""
                     )
-                    print(json.dumps({
+                    _emit({
                         "type": "playlist_loaded",
                         "partial": True,
                         "title": _title_p,
@@ -2902,18 +2931,24 @@ def main():
                             {"artist": t.artist_string, "title": t.title, "duration_ms": t.duration_ms or 0}
                             for t in tracks_so_far
                         ],
-                    }), flush=True)
+                    }, perf_name="playlist_loaded")
                 else:
-                    print(json.dumps({
+                    _emit({
                         "type": "tracks_appended",
                         "tracks": [
                             {"artist": t.artist_string, "title": t.title, "duration_ms": t.duration_ms or 0}
                             for t in new_tracks
                         ],
-                    }), flush=True)
+                    }, perf_name="tracks_appended")
                 _page_state["sent"] = len(tracks_so_far)
 
             tracks = service.fetch_playlist_tracks(url, options=options, enrich_override=False, page_callback=_on_page)
+            log_phase(
+                logger,
+                "metadata",
+                metadata_started,
+                counts={"tracks": len(tracks)},
+            )
 
             # Emit the full tracklist immediately after metadata is fetched,
             # before any individual downloads begin.
@@ -2935,7 +2970,7 @@ def main():
                     'alac': 'ALAC',
                     'm4a': 'AAC', 'aac': 'AAC', 'mp3': 'MP3',
                 }
-                print(json.dumps({
+                _emit({
                     "type": "playlist_loaded",
                     "title": _title_early,
                     "artwork_url": _artwork_early,
@@ -2952,17 +2987,24 @@ def main():
                         }
                         for t in tracks
                     ],
-                }), flush=True)
+                }, perf_name="playlist_loaded")
 
             _emit({"type": "job_preparing", "stage": "sources", "message": "Preparing source matching and download folders…"})
+            source_prep_started = start_phase()
             tracks = service.enrich_tracks_for_download(tracks, url, options=options)
+            log_phase(
+                logger,
+                "source preparation",
+                source_prep_started,
+                counts={"tracks": len(tracks)},
+            )
 
             from antra.core.control import DownloadController
             controller = DownloadController(initial_workers=int(os.environ.get("ANTRA_MAX_WORKERS", "2")))
             results = service.download_tracks(
                 tracks,
                 options=options,
-                event_callback=emit_event,
+                event_callback=lambda event: emit_event(event, str(organizer.root)),
                 organizer=organizer,
                 controller=controller,
             )
@@ -2973,6 +3015,7 @@ def main():
                 for r in results
                 if r.file_path and _os.path.exists(r.file_path)
             )
+            _completed_files = completed_library_files(results, str(organizer.root))
             _title = ""
             _artwork_summary = ""
             if tracks:
@@ -3000,6 +3043,7 @@ def main():
                 "date": datetime.now().isoformat(),
                 "total_mb": round(_total_bytes / (1024 * 1024), 1),
                 "elapsed_seconds": round(_elapsed),
+                "completed_files": _completed_files,
             }
 
             for r in results:
@@ -3007,7 +3051,12 @@ def main():
                     summary["sources"][r.source_used] = summary["sources"].get(r.source_used, 0) + 1
 
             downloaded = summary["downloaded"]
-            print(json.dumps({"type": "library_update", "tracks_added": downloaded, "url": url}), flush=True)
+            print(json.dumps({
+                "type": "library_update",
+                "tracks_added": downloaded,
+                "url": url,
+                "completed_files": _completed_files,
+            }), flush=True)
             print(json.dumps(summary), flush=True)
 
         except Exception as e:
@@ -3030,6 +3079,7 @@ def main():
                 "date": datetime.now().isoformat(),
                 "total_mb": 0,
                 "elapsed_seconds": round(_elapsed),
+                "completed_files": [],
             }
             print(json.dumps(summary), flush=True)
 

@@ -2,6 +2,8 @@
 Abstract base class for all audio source adapters.
 """
 from abc import ABC, abstractmethod
+from enum import Enum
+import threading
 from typing import Optional
 
 from antra.core.models import TrackMetadata, SearchResult, AudioFormat
@@ -14,6 +16,22 @@ class RateLimitedError(Exception):
     no retry delay, no further attempts — and fall through to the next source.
     """
 
+class FailureCategory(str, Enum):
+    TRANSIENT = "transient"
+    NO_MATCH = "no_match"
+    RATE_LIMITED = "rate_limited"
+    AUTH = "auth"
+    UNSUPPORTED = "unsupported"
+    STORAGE = "storage"
+    CANCELLED = "cancelled"
+    DETERMINISTIC = "deterministic"
+
+
+class ClassifiedSourceError(RuntimeError):
+    def __init__(self, message: str, category: FailureCategory):
+        super().__init__(message)
+        self.category = category
+
 
 class BaseSourceAdapter(ABC):
     """
@@ -25,6 +43,34 @@ class BaseSourceAdapter(ABC):
     name: str = "base"
     priority: int = 99  # Lower = higher priority
     always_lossy: bool = False  # True for adapters that can never return lossless audio
+    max_concurrent_searches: int = 8
+    _progress_tls = threading.local()
+
+    def set_download_progress_callback(self, callback) -> None:
+        self._progress_tls.callback = callback
+
+    def report_download_progress(
+        self,
+        bytes_downloaded: int,
+        bytes_total: Optional[int] = None,
+        phase: str = "transferring",
+    ) -> None:
+        callback = getattr(getattr(self, "_progress_tls", None), "callback", None)
+        if callback:
+            callback(max(0, int(bytes_downloaded)), bytes_total, phase)
+
+    def write_stream_to_file(self, response, path: str, chunk_size: int = 131072) -> int:
+        header = response.headers.get("Content-Length")
+        total = int(header) if header and str(header).isdigit() else None
+        downloaded = 0
+        with open(path, "wb") as handle:
+            for chunk in response.iter_content(chunk_size=chunk_size):
+                if not chunk:
+                    continue
+                handle.write(chunk)
+                downloaded += len(chunk)
+                self.report_download_progress(downloaded, total)
+        return downloaded
 
     @abstractmethod
     def is_available(self) -> bool:

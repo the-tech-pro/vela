@@ -14,6 +14,7 @@ import re
 import threading
 import time
 from collections import defaultdict
+from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Optional
 
 from antra.core.models import TrackMetadata, SearchResult
@@ -68,6 +69,14 @@ class SourceResolver:
 
     # How long (seconds) a rate-limited adapter is moved to the back of its tier.
     RATE_LIMIT_COOLDOWN_SECONDS = 30
+    # All resolver instances share one process-wide fixed search pool so neither
+    # tracks nor short-lived resolver instances can multiply worker threads.
+    # Per-adapter semaphores below provide the stricter provider limits.
+    MAX_PARALLEL_SEARCHES = 8
+    _search_executor = ThreadPoolExecutor(
+        max_workers=MAX_PARALLEL_SEARCHES,
+        thread_name_prefix="antra-resolver-search",
+    )
 
     def __init__(
         self,
@@ -112,6 +121,17 @@ class SourceResolver:
         self._album_source_wins: dict[str, dict[str, int]] = {}
         self._album_source_bit_depths: dict[str, dict[str, int]] = {}
         self._album_source_lock = threading.Lock()
+        adapter_search_limits = {
+            adapter.name: max(
+                1,
+                int(getattr(adapter, "max_concurrent_searches", 8)),
+            )
+            for adapter in self.adapters
+        }
+        self._adapter_search_slots = {
+            name: threading.BoundedSemaphore(limit)
+            for name, limit in adapter_search_limits.items()
+        }
         names = [f"{a.name}(p={a.priority})" for a in self.adapters]
         logger.debug(f"Source resolver initialized with adapters: {names}")
 
@@ -120,6 +140,106 @@ class SourceResolver:
         resolve() call (empty dict if none). Used by the engine to build the
         per-track source-chain summary on failure."""
         return dict(getattr(self._report_tls, "data", {}) or {})
+
+    def _search_adapter(
+        self,
+        adapter: BaseSourceAdapter,
+        track: TrackMetadata,
+    ) -> Optional[SearchResult]:
+        """Run one provider search under its cross-resolve concurrency limit."""
+        with self._adapter_search_slots[adapter.name]:
+            return adapter.search(track)
+
+    def _capture_search_outcome(
+        self,
+        adapter: BaseSourceAdapter,
+        track: TrackMetadata,
+        mark_rate_limits: bool,
+    ) -> tuple[Optional[SearchResult], Optional[Exception]]:
+        """Capture normal provider failures without losing prompt cooldowns."""
+        try:
+            return self._search_adapter(adapter, track), None
+        except Exception as error:
+            if mark_rate_limits and isinstance(error, RateLimitedError):
+                self._mark_rate_limited(adapter.name)
+            return None, error
+
+    @staticmethod
+    def _consume_future_exception(future: Future) -> None:
+        """Observe a detached future so worker exceptions are never abandoned."""
+        if future.cancelled():
+            return
+        try:
+            future.exception()
+        except Exception:
+            pass
+
+    def _cancel_search_futures(self, futures: list[Future]) -> None:
+        """Cancel work that has not started and safely drain work already running."""
+        for future in futures:
+            future.cancel()
+        for future in futures:
+            if future.cancelled():
+                continue
+            if future.done():
+                self._consume_future_exception(future)
+            else:
+                future.add_done_callback(self._consume_future_exception)
+
+    def _search_adapter_batch(
+        self,
+        adapters: list[BaseSourceAdapter],
+        track: TrackMetadata,
+        mark_rate_limits: bool = True,
+    ) -> list[
+        tuple[
+            BaseSourceAdapter,
+            Optional[SearchResult],
+            Optional[Exception],
+        ]
+    ]:
+        """Search a tier concurrently, returning outcomes in resolver order.
+
+        Completion order is deliberately ignored: rotation and provider-stat
+        ordering remain the deterministic tie-breakers. Singleton waterfall
+        batches use the same executor so concurrent resolve() callers still
+        share one fixed global search bound.
+        """
+        adapter_futures = []
+        try:
+            for adapter in adapters:
+                adapter_futures.append(
+                    (
+                        adapter,
+                        self._search_executor.submit(
+                            self._capture_search_outcome,
+                            adapter,
+                            track,
+                            mark_rate_limits,
+                        ),
+                    )
+                )
+        except BaseException:
+            self._cancel_search_futures(
+                [future for _, future in adapter_futures]
+            )
+            raise
+
+        outcomes = []
+        try:
+            for adapter, future in adapter_futures:
+                try:
+                    result, search_error = future.result()
+                except Exception as unexpected_error:
+                    outcomes.append((adapter, None, unexpected_error))
+                else:
+                    outcomes.append((adapter, result, search_error))
+        except BaseException:
+            self._cancel_search_futures(
+                [future for _, future in adapter_futures[len(outcomes):]]
+            )
+            raise
+        return outcomes
 
     def record_outcome(self, adapter_name: str, success: bool) -> None:
         """Persist a download outcome for adapter_name (SF-1). Non-fatal."""
@@ -423,9 +543,11 @@ class SourceResolver:
         self,
         track: TrackMetadata,
         adapter: BaseSourceAdapter,
+        excluded_adapters: Optional[set[str]] = None,
     ) -> bool:
+        excluded = excluded_adapters or set()
         if getattr(track, "amazon_asin", None):
-            amazon_excluded = "amazon" in getattr(self, "_current_excluded_for_track", set())
+            amazon_excluded = "amazon" in excluded
             if not amazon_excluded:
                 # In quality-aware (lossless) mode, don't restrict to Amazon-only —
                 # we want to query Qobuz/HiFi as well so the best-quality source wins.
@@ -455,6 +577,161 @@ class SourceResolver:
                 return False
             return (getattr(track, "source_service", None) or "").lower() != "deezer"
         return False
+
+    def _adapter_is_eligible_for_track(
+        self,
+        track: TrackMetadata,
+        adapter: BaseSourceAdapter,
+        excluded: set[str],
+        amazon_asin_prequeried: bool,
+    ) -> bool:
+        """Apply the legacy per-adapter gates immediately before its tier runs."""
+        if self._should_skip_adapter_for_track(track, adapter, excluded):
+            logger.debug(
+                "[Resolver] Skipping %s for '%s' — filtered by source-specific rule",
+                adapter.name,
+                track.title,
+            )
+            return False
+
+        # In quality-aware mode with an ASIN track, Amazon is queried in the
+        # normal adapter loop. Skip it only if the non-quality pre-check already
+        # searched it and failed.
+        if adapter.name == "amazon" and amazon_asin_prequeried:
+            logger.debug(
+                "[Resolver] Skipping Amazon for '%s' — already tried in ASIN pre-check and failed",
+                track.title,
+            )
+            return False
+
+        # HiFi throttle check — only defer to Amazon if Amazon has not already
+        # failed. This gate remains ahead of dispatch so a skipped adapter never
+        # consumes a worker or a provider semaphore slot.
+        if adapter.name == "hifi" and hasattr(adapter, "is_throttled") and adapter.is_throttled():
+            amazon_already_failed = "amazon" in excluded
+            if not amazon_already_failed:
+                logger.info(
+                    "[Resolver] HiFi is throttled — deferring to Amazon first. "
+                    "HiFi will be retried if Amazon also fails."
+                )
+                return False
+            logger.info(
+                "[Resolver] HiFi is throttled but Amazon already failed — "
+                "trying HiFi anyway (preferred lossless fallback)."
+            )
+
+        # Lossless-only mode excludes lossy-only sources, except native Apple in
+        # ALAC mode where the wrapper may provide lossless audio.
+        if self._is_lossless_only_mode() and getattr(adapter, "always_lossy", False):
+            source_service = (getattr(track, "source_service", None) or "").lower()
+            is_alac_mode = self.preferred_output_format in {"alac", "alac-16", "alac-24"}
+            if source_service != adapter.name or not is_alac_mode:
+                logger.debug(
+                    "[Resolver] Skipping %s — lossy-only source in lossless mode",
+                    adapter.name,
+                )
+                return False
+            logger.debug(
+                "[Resolver] Including %s in ALAC mode — track originates from this platform",
+                adapter.name,
+            )
+
+        return True
+
+    def _requires_serial_search_barrier(
+        self,
+        adapter: BaseSourceAdapter,
+        preferred_album_adapter: Optional[str],
+    ) -> bool:
+        """Return True when this adapter can end the legacy waterfall early."""
+        if not self._is_quality_aware_mode():
+            return True
+        if preferred_album_adapter and adapter.name == preferred_album_adapter:
+            return True
+        if adapter.name == "hifi" and hasattr(adapter, "is_throttled"):
+            return True
+        if (
+            adapter.name == "apple"
+            and self.preferred_output_format in {"alac", "alac-16", "alac-24"}
+        ):
+            return True
+        return (
+            self._is_lossless16_mode()
+            and adapter.name in {"deezer", "deezer_mirror"}
+        )
+
+    def _build_search_batches(
+        self,
+        resolve_order: list[BaseSourceAdapter],
+        preferred_album_adapter: Optional[str],
+    ) -> list[list[BaseSourceAdapter]]:
+        """Partition resolver order into bounded, semantically equivalent tiers."""
+        batches: list[list[BaseSourceAdapter]] = []
+        current_batch: list[BaseSourceAdapter] = []
+        current_key: Optional[tuple[int, bool]] = None
+
+        def flush_current() -> None:
+            nonlocal current_batch, current_key
+            if current_batch:
+                batches.append(current_batch)
+                current_batch = []
+                current_key = None
+
+        for adapter in resolve_order:
+            if self._requires_serial_search_barrier(
+                adapter,
+                preferred_album_adapter,
+            ):
+                flush_current()
+                batches.append([adapter])
+                continue
+
+            cooling = (
+                self._is_rate_limited(adapter.name)
+                and not getattr(adapter, "_premium_endpoints", None)
+            )
+            tier_key = (adapter.priority, cooling)
+            if current_batch and tier_key != current_key:
+                flush_current()
+            current_key = tier_key
+            current_batch.append(adapter)
+
+        flush_current()
+        return batches
+
+    def _iter_search_outcomes(
+        self,
+        track: TrackMetadata,
+        resolve_order: list[BaseSourceAdapter],
+        excluded: set[str],
+        amazon_asin_prequeried: bool,
+        preferred_album_adapter: Optional[str],
+    ):
+        """Yield completed tier outcomes in deterministic resolver order."""
+        for raw_batch in self._build_search_batches(
+            resolve_order,
+            preferred_album_adapter,
+        ):
+            batch = [
+                adapter
+                for adapter in raw_batch
+                if self._adapter_is_eligible_for_track(
+                    track,
+                    adapter,
+                    excluded,
+                    amazon_asin_prequeried,
+                )
+            ]
+            if not batch:
+                continue
+
+            if self.preserve_input_order:
+                for adapter in batch:
+                    logger.info(
+                        f"[Resolver] Trying {adapter.name} for: {track.title}"
+                    )
+
+            yield from self._search_adapter_batch(batch, track)
 
 
 
@@ -821,7 +1098,6 @@ class SourceResolver:
           delivers 16-bit streams; Qobuz/HiFi may have true hi-res for the same track.
         """
         excluded = excluded_adapters or set()
-        self._current_excluded_for_track = set(excluded)
         report: dict[str, str] = {}
         self._report_tls.data = report
 
@@ -848,7 +1124,13 @@ class SourceResolver:
             )
             if amazon_adapter:
                 try:
-                    result = amazon_adapter.search(track)
+                    _, result, search_error = self._search_adapter_batch(
+                        [amazon_adapter],
+                        track,
+                        mark_rate_limits=False,
+                    )[0]
+                    if search_error is not None:
+                        result = None
                 except Exception:
                     result = None
                 if result:
@@ -877,75 +1159,21 @@ class SourceResolver:
 
         preferred_album_adapter = self._preferred_album_adapter_name(track, excluded)
         resolve_order = self._build_track_resolve_order(track, excluded)
+        search_outcomes = self._iter_search_outcomes(
+            track,
+            resolve_order,
+            excluded,
+            _amazon_asin_prequeried,
+            preferred_album_adapter,
+        )
 
-        for adapter in resolve_order:
-            if self._should_skip_adapter_for_track(track, adapter):
-                logger.debug(
-                    "[Resolver] Skipping %s for '%s' — filtered by source-specific rule",
-                    adapter.name,
-                    track.title,
-                )
-                continue
-
-            # In quality-aware mode with an ASIN track, Amazon is queried here in the
-            # normal adapter loop (not via the early-return pre-check). Its search()
-            # uses track.amazon_asin directly so it's still an exact match.
-            # Skip it only if we already tried it in the non-quality-aware pre-check
-            # above and it failed (_amazon_asin_prequeried=True, result=None).
-            if adapter.name == "amazon" and _amazon_asin_prequeried:
-                logger.debug(
-                    "[Resolver] Skipping Amazon for '%s' — already tried in ASIN pre-check and failed",
-                    track.title,
-                )
-                continue
-
-            # HiFi throttle check — only defer to Amazon if Amazon hasn't already
-            # been tried and failed. If Amazon is excluded (failed), we come back
-            # to HiFi even when throttled — it's still lossless and better than
-            # falling to JioSaavn or YouTube.
-            if adapter.name == "hifi" and hasattr(adapter, "is_throttled") and adapter.is_throttled():
-                amazon_already_failed = "amazon" in excluded
-                if not amazon_already_failed:
-                    logger.info(
-                        "[Resolver] HiFi is throttled — deferring to Amazon first. "
-                        "HiFi will be retried if Amazon also fails."
-                    )
-                    continue
-                else:
-                    logger.info(
-                        "[Resolver] HiFi is throttled but Amazon already failed — "
-                        "trying HiFi anyway (preferred lossless fallback)."
-                    )
-
-            # In lossless-only mode, skip adapters that only serve lossy audio
-            # (Apple, JioSaavn, NetEase, YouTube).
-            # Exception: if the track came from this adapter's platform (e.g. an
-            # Apple Music URL → apple adapter), include it anyway so it can win
-            # the lossless sort and download via the wrapper ALAC path if available.
-            # If the wrapper isn't running, the download raises a clear error and
-            # the engine falls back to the next lossless source — no quality loss.
-            if self._is_lossless_only_mode() and getattr(adapter, "always_lossy", False):
-                source_service = (getattr(track, "source_service", None) or "").lower() if track else ""
-                # Only include Apple for its own tracks AND only in ALAC mode — the
-                # early-return fires immediately after search, so this bypass is
-                # narrowly scoped and never leaks Apple into FLAC lossless_candidates.
-                is_alac_mode = self.preferred_output_format in {"alac", "alac-16", "alac-24"}
-                if source_service != adapter.name or not is_alac_mode:
-                    logger.debug(f"[Resolver] Skipping {adapter.name} — lossy-only source in lossless mode")
-                    continue
-                logger.debug(f"[Resolver] Including {adapter.name} in ALAC mode — track originates from this platform")
-
-            if self.preserve_input_order:
-                logger.info(f"[Resolver] Trying {adapter.name} for: {track.title}")
-            try:
-                result = adapter.search(track)
-            except RateLimitedError:
+        for adapter, result, search_error in search_outcomes:
+            if isinstance(search_error, RateLimitedError):
                 report[adapter.name] = "rate-limited"
-                self._mark_rate_limited(adapter.name)
                 continue
-            except Exception as e:
+            if search_error is not None:
                 report[adapter.name] = "search error"
-                logger.warning(f"[Resolver] {adapter.name} search error: {e}")
+                logger.warning(f"[Resolver] {adapter.name} search error: {search_error}")
                 continue
 
             if result is None:

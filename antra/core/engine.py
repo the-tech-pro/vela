@@ -1,14 +1,20 @@
 """
 Download engine — orchestrates resolve → download → tag → organize.
 """
+import copy
 import logging
+import heapq
+import hashlib
 import os
+import queue
+import random
 import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from dataclasses import dataclass, fields
 from typing import Callable, Optional
 
 from mutagen import File as MutagenFile
@@ -17,14 +23,114 @@ from antra.core.control import DownloadController
 from antra.core.events import EngineEvent, EngineEventType
 from antra.core.models import AudioFormat, TrackMetadata, DownloadResult, DownloadStatus
 from antra.core.resolver import SourceResolver
-from antra.sources.base import RateLimitedError
+from antra.sources.base import (
+    ClassifiedSourceError,
+    FailureCategory,
+    RateLimitedError,
+)
 from antra.utils.matching import duration_close
 from antra.utils.lyrics import LyricsFetcher
 from antra.utils.organizer import LibraryOrganizer
+from antra.utils.perf import elapsed_seconds, log_phase, start_phase
 from antra.utils.tagger import FileTagger
 from antra.utils.transcoder import AudioTranscoder
 
 logger = logging.getLogger(__name__)
+
+_LYRICS_STOP = object()
+
+
+def _lyrics_snapshot(track: TrackMetadata) -> TrackMetadata:
+    """Copy only normalized metadata fields, excluding dynamic runtime state."""
+    return TrackMetadata(**{
+        field.name: copy.deepcopy(getattr(track, field.name))
+        for field in fields(TrackMetadata)
+    })
+
+
+@dataclass(frozen=True)
+class _AudioProbeResult:
+    """Audio properties read once for one immutable file fingerprint."""
+
+    duration_seconds: float | None = None
+    codec: str = ""
+    bit_depth: int | None = None
+    sample_rate: int | None = None
+    bitrate: int | None = None
+    channels: int | None = None
+    has_info: bool = False
+
+
+class _LyricsFetchTask:
+    """Fetch lyrics from isolated metadata snapshots while audio work proceeds."""
+
+    def __init__(self, fetcher: LyricsFetcher, track: TrackMetadata):
+        self._fetcher = fetcher
+        self._snapshots: queue.Queue[object] = queue.Queue()
+        self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._closed = False
+        self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vela-lyrics")
+        try:
+            self._future = self._executor.submit(self._run, _lyrics_snapshot(track))
+        except Exception:
+            self._executor.shutdown(wait=False, cancel_futures=True)
+            raise
+
+    def retry_with(self, track: TrackMetadata) -> None:
+        """Queue the same retry the synchronous pipeline made after hydration."""
+        try:
+            snapshot = _lyrics_snapshot(track)
+        except Exception as exc:
+            logger.debug("  ℹ  Lyrics retry snapshot failed: %s", exc)
+            return
+        with self._lock:
+            if self._closed or self._future.done():
+                return
+            self._snapshots.put(snapshot)
+
+    def finish(self, track: TrackMetadata) -> None:
+        """Wait for queued attempts and apply their result before final tagging."""
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._snapshots.put(_LYRICS_STOP)
+        try:
+            result = self._future.result()
+        except Exception as exc:
+            logger.debug("  ℹ  Lyrics fetch task failed: %s", exc)
+            result = None
+        finally:
+            self._executor.shutdown(wait=True, cancel_futures=True)
+
+        if result and not (track.lyrics or track.synced_lyrics):
+            track.lyrics, track.synced_lyrics = result
+
+    def cancel(self) -> None:
+        """Stop queued retries without waiting for an in-flight bounded request."""
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                self._cancelled.set()
+                self._snapshots.put(_LYRICS_STOP)
+        self._future.cancel()
+        self._executor.shutdown(wait=False, cancel_futures=True)
+
+    def _run(self, initial_snapshot: TrackMetadata) -> tuple[Optional[str], Optional[str]] | None:
+        snapshot: object = initial_snapshot
+        while snapshot is not _LYRICS_STOP and not self._cancelled.is_set():
+            try:
+                plain, synced = self._fetcher.fetch(snapshot)
+            except Exception as exc:
+                logger.debug("  ℹ  Lyrics fetch failed: %s", exc)
+                plain, synced = None, None
+            if self._cancelled.is_set():
+                return None
+            if plain or synced:
+                return plain, synced
+            snapshot = self._snapshots.get()
+        return None
+
 
 # errno values that indicate the output filesystem is no longer accessible
 # (NAS disconnected, drive ejected, SMB session dropped after sleep, etc.)
@@ -85,6 +191,44 @@ def _summarize_source_error(msg: str) -> str:
     return (msg or "failed").strip()[:50]
 
 
+def classify_download_failure(error: BaseException | str) -> FailureCategory:
+    if isinstance(error, ClassifiedSourceError):
+        return error.category
+    if isinstance(error, RateLimitedError):
+        return FailureCategory.RATE_LIMITED
+    message = str(error or "").lower()
+    if any(word in message for word in ("cancelled", "canceled")):
+        return FailureCategory.CANCELLED
+    if any(word in message for word in (
+        "unauthorized", "authentication", "authorization", "token expired",
+        "reconnect your account", "forbidden", "credential",
+    )):
+        return FailureCategory.AUTH
+    if any(word in message for word in (
+        "unsupported", "not supported", "drm-protected", "invalid format",
+    )):
+        return FailureCategory.UNSUPPORTED
+    if any(word in message for word in (
+        "output directory", "mount", "read-only filesystem", "disk full",
+        "no space left", "permission denied",
+    )):
+        return FailureCategory.STORAGE
+    if any(word in message for word in ("rate limit", "rate-limit", "429", "too many requests")):
+        return FailureCategory.RATE_LIMITED
+    if any(word in message for word in (
+        "no matching source", "no source could find", "no catalog match",
+        "no confident match", "track not found",
+    )):
+        return FailureCategory.NO_MATCH
+    if any(word in message for word in (
+        "timeout", "timed out", "connection reset", "connection aborted",
+        "temporarily unavailable", "service unavailable", "bad gateway",
+        "server error", "truncated", "500", "502", "503", "504",
+    )):
+        return FailureCategory.TRANSIENT
+    return FailureCategory.DETERMINISTIC
+
+
 @dataclass
 class EngineConfig:
     max_retries: int = 3
@@ -95,6 +239,8 @@ class EngineConfig:
     output_format: str = "source"
     strict_matching: bool = False
     max_workers: int = 1
+    auto_retry_window_seconds: float = 300.0
+    auto_retry_backoff_seconds: float = 5.0
 
 
 class DownloadEngine:
@@ -110,9 +256,14 @@ class DownloadEngine:
         self.resolver = resolver
         self.organizer = organizer
         self.lyrics = lyrics_fetcher
-        self.tagger = FileTagger()
-        self.transcoder = AudioTranscoder()
         self.cfg = config or EngineConfig()
+        self.tagger = FileTagger()
+        self._probe_cache: dict[tuple[str, int | None, int | None], _AudioProbeResult] = {}
+        self._probe_inflight: dict[tuple[str, int | None, int | None], threading.Event] = {}
+        self._decode_probe_cache: dict[tuple[str, int | None, int | None], bool] = {}
+        self._decode_probe_inflight: dict[tuple[str, int | None, int | None], threading.Event] = {}
+        self._probe_lock = threading.Lock()
+        self.transcoder = AudioTranscoder(probe_lookup=self._probe_audio)
         self.event_callback = event_callback
         self.controller = controller
         self._emit_lock = threading.Lock()
@@ -125,6 +276,10 @@ class DownloadEngine:
         # 5 minutes so the resolver stops selecting it for subsequent tracks.
         self._adapter_server_errors: dict[str, int] = {}
         self._adapter_server_errors_lock = threading.Lock()
+        self._event_context = threading.local()
+        if self.controller:
+            self.controller._on_state_change = self._emit_worker_state
+            self._emit_worker_state(self.controller.worker_state())
 
     def _signal_output_lost(self, exc: OSError) -> None:
         """Record the first mount-loss error so workers can abort fast."""
@@ -141,11 +296,44 @@ class DownloadEngine:
     def _emit(self, event_type: EngineEventType, **kwargs):
         if not self.event_callback:
             return
+        kwargs.setdefault("job_id", getattr(self._event_context, "job_id", None))
+        kwargs.setdefault("track_id", getattr(self._event_context, "track_id", None))
         with self._emit_lock:
             try:
                 self.event_callback(EngineEvent(type=event_type, **kwargs))
             except Exception as e:
                 logger.debug(f"Event callback failed: {e}")
+
+    def _emit_worker_state(self, state: dict) -> None:
+        self._emit(
+            EngineEventType.WORKER_STATE,
+            active_workers=state.get("active"),
+            configured_workers=state.get("configured"),
+            worker_ceiling=state.get("ceiling"),
+            phase="paused" if state.get("paused") else "active",
+        )
+
+    @staticmethod
+    def _track_event_id(track: TrackMetadata, index: int) -> str:
+        recording_identity = (
+            track.spotify_id
+            or track.apple_music_id
+            or track.deezer_track_id
+            or track.tidal_track_id
+            or track.isrc
+            or f"{track.artist_string}|{track.title}|{track.album}|{track.duration_ms or 0}"
+        )
+        identity = f"{recording_identity}|occurrence:{index}"
+        return hashlib.sha256(str(identity).encode("utf-8")).hexdigest()[:20]
+
+    def _emit_phase(self, phase: str, track: TrackMetadata, track_index: int, track_total: int) -> None:
+        self._emit(
+            EngineEventType.TRACK_PHASE,
+            track=track,
+            track_index=track_index,
+            track_total=track_total,
+            phase=phase,
+        )
 
     @staticmethod
     def _hydrate_track_metadata(track: TrackMetadata, result) -> None:
@@ -165,6 +353,17 @@ class DownloadEngine:
             track.synced_lyrics = synced
         except Exception as e:
             logger.debug(f"  ℹ  Lyrics fetch failed: {e}")
+
+    def _start_lyrics_fetch(self, track: TrackMetadata) -> _LyricsFetchTask | None:
+        if not self.cfg.fetch_lyrics or not self.lyrics:
+            return None
+        if track.lyrics or track.synced_lyrics:
+            return None
+        try:
+            return _LyricsFetchTask(self.lyrics, track)
+        except Exception as exc:
+            logger.debug("  ℹ  Lyrics background start failed: %s", exc)
+            return None
 
     @staticmethod
     def _enrich_genres_if_needed(track: TrackMetadata) -> None:
@@ -354,7 +553,90 @@ class DownloadEngine:
             )
 
     @staticmethod
-    def _audio_format_from_path(file_path: str) -> AudioFormat | None:
+    def _file_fingerprint(file_path: str) -> tuple[str, int | None, int | None]:
+        normalized_path = os.path.normcase(os.path.abspath(file_path))
+        try:
+            stat = os.stat(file_path)
+        except OSError:
+            return normalized_path, None, None
+        return normalized_path, stat.st_size, stat.st_mtime_ns
+
+    @staticmethod
+    def _probe_int(value) -> int | None:
+        try:
+            return int(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    def _probe_audio(self, file_path: str) -> _AudioProbeResult:
+        """Return one singleflight Mutagen/ffprobe result per file fingerprint."""
+        fingerprint = self._file_fingerprint(file_path)
+        while True:
+            with self._probe_lock:
+                if fingerprint in self._probe_cache:
+                    return self._probe_cache[fingerprint]
+                flight = self._probe_inflight.get(fingerprint)
+                if flight is None:
+                    flight = threading.Event()
+                    self._probe_inflight[fingerprint] = flight
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                break
+            flight.wait()
+
+        probe = _AudioProbeResult()
+        try:
+            probe = self._read_audio_probe(file_path)
+        except Exception as exc:
+            logger.debug("[Engine] Audio probe failed for %s: %s", file_path, exc)
+        finally:
+            with self._probe_lock:
+                self._probe_cache[fingerprint] = probe
+                self._probe_inflight.pop(fingerprint, None)
+                flight.set()
+        return probe
+
+    def _read_audio_probe(self, file_path: str) -> _AudioProbeResult:
+        audio = None
+        mutagen_failed = False
+        try:
+            audio = MutagenFile(file_path)
+        except Exception:
+            mutagen_failed = True
+        info = getattr(audio, "info", None)
+
+        codec = str(getattr(info, "codec", "") or "").lower() if info else ""
+        bit_depth = self._probe_int(getattr(info, "bits_per_sample", None)) if info else None
+        sample_rate = self._probe_int(getattr(info, "sample_rate", None)) if info else None
+        bitrate = self._probe_int(getattr(info, "bitrate", None)) if info else None
+        channels = self._probe_int(getattr(info, "channels", None)) if info else None
+
+        ext = os.path.splitext(file_path)[1].lower()
+        duration: float | None = None
+        if ext == ".m4a":
+            duration = self._probe_duration_seconds_with_ffprobe(file_path)
+        elif not mutagen_failed:
+            length = getattr(info, "length", None) if info else None
+            try:
+                duration = float(length) if length is not None else None
+            except (TypeError, ValueError):
+                duration = None
+            if duration is None:
+                duration = self._probe_duration_seconds_with_ffprobe(file_path)
+
+        return _AudioProbeResult(
+            duration_seconds=duration,
+            codec=codec,
+            bit_depth=bit_depth,
+            sample_rate=sample_rate,
+            bitrate=bitrate,
+            channels=channels,
+            has_info=bool(info),
+        )
+
+    def _audio_format_from_path(self, file_path: str) -> AudioFormat | None:
         ext = file_path.lower().rsplit(".", 1)[-1] if "." in file_path else ""
         basic = {
             "flac": AudioFormat.FLAC,
@@ -364,42 +646,29 @@ class DownloadEngine:
         if basic is not None:
             return basic
         if ext == "m4a":
-            try:
-                audio = MutagenFile(file_path)
-                codec = str(getattr(getattr(audio, "info", None), "codec", "") or "").lower()
-                if codec.startswith("alac"):
-                    return AudioFormat.ALAC
-            except Exception:
-                pass
+            if self._probe_audio(file_path).codec.startswith("alac"):
+                return AudioFormat.ALAC
             return AudioFormat.AAC
         return None
 
-    @classmethod
     def _quality_label_from_file(
-        cls,
+        self,
         file_path: str,
         fallback_format: AudioFormat | None,
         fallback_label: str,
     ) -> str:
-        try:
-            audio = MutagenFile(file_path)
-        except Exception:
-            audio = None
-        info = getattr(audio, "info", None)
-        detected_format = cls._audio_format_from_path(file_path) or fallback_format
-        if info and detected_format is not None:
-            sample_rate = getattr(info, "sample_rate", None)
-            bit_depth = getattr(info, "bits_per_sample", None)
-            bitrate = getattr(info, "bitrate", None)
+        probe = self._probe_audio(file_path)
+        detected_format = self._audio_format_from_path(file_path) or fallback_format
+        if probe.has_info and detected_format is not None:
             fmt = detected_format.value.upper()
             if detected_format in {AudioFormat.FLAC, AudioFormat.ALAC}:
-                if bit_depth and sample_rate:
-                    return f"{fmt} {int(bit_depth)}-bit/{int(sample_rate) // 1000}kHz"
-                if bit_depth:
-                    return f"{fmt} {int(bit_depth)}-bit"
+                if probe.bit_depth and probe.sample_rate:
+                    return f"{fmt} {probe.bit_depth}-bit/{probe.sample_rate // 1000}kHz"
+                if probe.bit_depth:
+                    return f"{fmt} {probe.bit_depth}-bit"
                 return fmt
-            if bitrate:
-                return f"{fmt} {int(bitrate) // 1000}kbps"
+            if probe.bitrate:
+                return f"{fmt} {probe.bitrate // 1000}kbps"
             return fmt
         return fallback_label
 
@@ -424,28 +693,8 @@ class DownloadEngine:
     def _is_lossy_output_mode(self) -> bool:
         return self.cfg.output_format in {"mp3", "aac", "m4a"}
 
-    @staticmethod
-    def _probe_duration_seconds(file_path: str) -> float | None:
-        # Mutagen is unreliable for some Apple-wrapper ALAC M4A files and can
-        # report short bogus durations (for example ~15s for a full-length song).
-        # Prefer ffprobe for MP4-family containers so lossless Apple downloads
-        # are not falsely flagged as truncated.
-        ext = os.path.splitext(file_path)[1].lower()
-        if ext == ".m4a":
-            return DownloadEngine._probe_duration_seconds_with_ffprobe(file_path)
-        try:
-            audio = MutagenFile(file_path)
-        except Exception:
-            return None
-        if not audio or not getattr(audio, "info", None):
-            return DownloadEngine._probe_duration_seconds_with_ffprobe(file_path)
-        length = getattr(audio.info, "length", None)
-        if length is None:
-            return DownloadEngine._probe_duration_seconds_with_ffprobe(file_path)
-        try:
-            return float(length)
-        except (TypeError, ValueError):
-            return DownloadEngine._probe_duration_seconds_with_ffprobe(file_path)
+    def _probe_duration_seconds(self, file_path: str) -> float | None:
+        return self._probe_audio(file_path).duration_seconds
 
     @staticmethod
     def _probe_duration_seconds_with_ffprobe(file_path: str) -> float | None:
@@ -478,13 +727,11 @@ class DownloadEngine:
         except (TypeError, ValueError):
             return None
 
-    @classmethod
-    def _is_truncated_download(cls, file_path: str, expected_duration_ms: int | None) -> bool:
-        return cls._get_truncation_reason(file_path, expected_duration_ms) is not None
+    def _is_truncated_download(self, file_path: str, expected_duration_ms: int | None) -> bool:
+        return self._get_truncation_reason(file_path, expected_duration_ms) is not None
 
-    @classmethod
     def _get_truncation_reason(
-        cls,
+        self,
         file_path: str,
         expected_duration_ms: int | None,
         result_duration_ms: int | None = None,
@@ -493,13 +740,13 @@ class DownloadEngine:
         if not expected_duration_ms or expected_duration_ms < 60000:
             return None
 
-        tiny_lossless_reason = cls._get_tiny_lossless_file_reason(file_path, expected_duration_ms)
+        tiny_lossless_reason = self._get_tiny_lossless_file_reason(file_path, expected_duration_ms)
         if tiny_lossless_reason is not None:
             return tiny_lossless_reason
 
-        actual_seconds = cls._probe_duration_seconds(file_path)
+        actual_seconds = self._probe_duration_seconds(file_path)
         if actual_seconds is None:
-            return cls._get_flac_truncation_reason(file_path)
+            return self._get_flac_truncation_reason(file_path)
         expected_seconds = expected_duration_ms / 1000.0
 
         def _severe_mismatch(expected_s: float, actual_s: float) -> bool:
@@ -523,7 +770,7 @@ class DownloadEngine:
             source_matches_expected = not _severe_mismatch(expected_seconds, result_seconds)
             if source_matches_expected and abs(actual_seconds - result_seconds) <= result_seconds * 0.05 + 5:
                 # File matches the source's own declared duration — not truncated.
-                return cls._get_flac_truncation_reason(file_path)
+                return self._get_flac_truncation_reason(file_path)
 
         # Gross duration mismatch check for all formats. This catches both
         # preview clips (~30s) and completely different full tracks.
@@ -540,7 +787,7 @@ class DownloadEngine:
             )
 
         # Secondary file-size check for FLAC files.
-        return cls._get_flac_truncation_reason(file_path)
+        return self._get_flac_truncation_reason(file_path)
 
     @staticmethod
     def _get_tiny_lossless_file_reason(file_path: str, expected_duration_ms: int | None) -> str | None:
@@ -566,12 +813,10 @@ class DownloadEngine:
             )
         return None
 
-    @classmethod
-    def _is_truncated_flac_by_size(cls, file_path: str) -> bool:
-        return cls._get_flac_truncation_reason(file_path) is not None
+    def _is_truncated_flac_by_size(self, file_path: str) -> bool:
+        return self._get_flac_truncation_reason(file_path) is not None
 
-    @staticmethod
-    def _get_flac_truncation_reason(file_path: str) -> str | None:
+    def _get_flac_truncation_reason(self, file_path: str) -> str | None:
         """
         Detect truncated FLAC downloads by comparing actual file size against
         the minimum expected size based on the FLAC header's own metadata.
@@ -589,16 +834,11 @@ class DownloadEngine:
             return None
 
         try:
-            from mutagen.flac import FLAC as FLACFile
-
-            audio = FLACFile(file_path)
-            if not audio or not audio.info:
-                return None
-
-            bits = getattr(audio.info, "bits_per_sample", None)
-            rate = getattr(audio.info, "sample_rate", None)
-            channels = getattr(audio.info, "channels", None)
-            length = getattr(audio.info, "length", None)
+            probe = self._probe_audio(file_path)
+            bits = probe.bit_depth
+            rate = probe.sample_rate
+            channels = probe.channels
+            length = probe.duration_seconds
 
             if not all((bits, rate, channels, length)):
                 return None
@@ -620,7 +860,7 @@ class DownloadEngine:
                     f"vs suspicious floor {min_expected_bytes / (1024*1024):.1f}MB "
                     f"(ratio={ratio:.2f}, {bits}bit/{rate}Hz/{length:.0f}s) — running decode probe"
                 )
-                if DownloadEngine._fails_flac_decode_probe(file_path):
+                if self._fails_flac_decode_probe(file_path):
                     return (
                         f"suspicious FLAC failed decode probe "
                         f"(ratio={ratio:.2f}, {bits}bit/{rate}Hz/{length:.0f}s)"
@@ -631,8 +871,38 @@ class DownloadEngine:
 
         return None
 
+    def _fails_flac_decode_probe(self, file_path: str) -> bool:
+        """Return one singleflight ffmpeg decode result per file fingerprint."""
+        fingerprint = self._file_fingerprint(file_path)
+        while True:
+            with self._probe_lock:
+                if fingerprint in self._decode_probe_cache:
+                    return self._decode_probe_cache[fingerprint]
+                flight = self._decode_probe_inflight.get(fingerprint)
+                if flight is None:
+                    flight = threading.Event()
+                    self._decode_probe_inflight[fingerprint] = flight
+                    owner = True
+                else:
+                    owner = False
+            if owner:
+                break
+            flight.wait()
+
+        failed = False
+        try:
+            failed = self._run_flac_decode_probe(file_path)
+        except Exception as exc:
+            logger.debug("[Engine] FLAC decode probe failed unexpectedly: %s", exc)
+        finally:
+            with self._probe_lock:
+                self._decode_probe_cache[fingerprint] = failed
+                self._decode_probe_inflight.pop(fingerprint, None)
+                flight.set()
+        return failed
+
     @staticmethod
-    def _fails_flac_decode_probe(file_path: str) -> bool:
+    def _run_flac_decode_probe(file_path: str) -> bool:
         """Return True when ffmpeg cannot fully decode the FLAC cleanly."""
         try:
             from antra.utils.runtime import get_ffmpeg_exe
@@ -677,8 +947,32 @@ class DownloadEngine:
         track: TrackMetadata,
         track_index: Optional[int] = None,
         track_total: Optional[int] = None,
+        defer_failure: bool = False,
+    ) -> DownloadResult:
+        """Run one track and always retire its background lyrics worker."""
+        lyrics_tasks: list[_LyricsFetchTask] = []
+        try:
+            return self._download_track_impl(
+                track,
+                track_index=track_index,
+                track_total=track_total,
+                defer_failure=defer_failure,
+                _lyrics_tasks=lyrics_tasks,
+            )
+        finally:
+            for task in lyrics_tasks:
+                task.cancel()
+
+    def _download_track_impl(
+        self,
+        track: TrackMetadata,
+        track_index: Optional[int],
+        track_total: Optional[int],
+        defer_failure: bool,
+        _lyrics_tasks: list[_LyricsFetchTask],
     ) -> DownloadResult:
         """Full pipeline for a single track."""
+        self._emit_phase("resolving", track, track_index or 0, track_total or 0)
 
         # 1. Resume check — only skip if the existing file meets the current output format.
         exact_output_existed = self.organizer.has_exact_output(track)
@@ -693,14 +987,8 @@ class DownloadEngine:
                 if ext in lossy_extensions:
                     is_lossy_file = True
                     if ext == ".m4a":
-                        try:
-                            from mutagen import File as _MF
-                            _audio = _MF(existing)
-                            _codec = str(getattr(getattr(_audio, "info", None), "codec", "") or "").lower()
-                            # alac codec = lossless; mp4a = AAC = lossy
-                            is_lossy_file = "alac" not in _codec
-                        except Exception:
-                            pass  # can't probe → assume lossy, re-download
+                        # alac codec = lossless; mp4a = AAC = lossy
+                        is_lossy_file = "alac" not in self._probe_audio(existing).codec
                     if is_lossy_file:
                         logger.info(
                             f"  [REDOWNLOAD]  '{track.title}' exists as lossy {ext} "
@@ -742,8 +1030,10 @@ class DownloadEngine:
                     file_path=existing,
                 )
 
-        # 2. Fetch lyrics once (before download, non-blocking)
-        self._fetch_lyrics_if_needed(track)
+        # 2. Fetch from isolated snapshots while resolve and transfer continue.
+        lyrics_task = self._start_lyrics_fetch(track)
+        if lyrics_task is not None:
+            _lyrics_tasks.append(lyrics_task)
 
         excluded_adapters: set[str] = set()
         # Adapters that were rate-limited get a second chance after all other
@@ -762,7 +1052,9 @@ class DownloadEngine:
         while True:
             # 3. Resolve — skip both permanently-excluded and currently rate-limited adapters.
             all_excluded = excluded_adapters | rate_limited_adapters
+            resolve_started = start_phase()
             resolution = self.resolver.resolve(track, excluded_adapters=all_excluded)
+            log_phase(logger, "resolve", resolve_started, subject=track.title)
             # Merge this cycle's search outcomes (no-match / search-error / found)
             # into the running chain. Excluded adapters aren't re-searched, so a
             # prior download-failure reason for them is preserved; the selected
@@ -809,15 +1101,16 @@ class DownloadEngine:
                         f"{name}: {reason}" for name, reason in source_chain.items()
                     )
                     logger.info(f"  [CHAIN]  {track.title} — sources tried → {chain_str}")
-                self.organizer.mark_failed(track, user_error)
-                self._emit(
-                    EngineEventType.TRACK_FAILED,
-                    track=track,
-                    track_index=track_index,
-                    track_total=track_total,
-                    source=last_source,
-                    error=user_error,
-                )
+                if not defer_failure:
+                    self.organizer.mark_failed(track, user_error)
+                    self._emit(
+                        EngineEventType.TRACK_FAILED,
+                        track=track,
+                        track_index=track_index,
+                        track_total=track_total,
+                        source=last_source,
+                        error=user_error,
+                    )
                 return DownloadResult(
                     track=track,
                     status=DownloadStatus.FAILED,
@@ -834,7 +1127,8 @@ class DownloadEngine:
                 used_lossy_fallback = True
             self._hydrate_track_metadata(track, result)
             adapter.hydrate_track_metadata(track, result)
-            self._fetch_lyrics_if_needed(track)
+            if lyrics_task is not None:
+                lyrics_task.retry_with(track)
             # Layout must use post-hydration metadata (album/year from the resolver, etc.)
             try:
                 output_base = self.organizer.get_output_path(track)
@@ -856,7 +1150,7 @@ class DownloadEngine:
             final_error: Optional[Exception] = None
 
             for attempt in range(1, self.cfg.max_retries + 1):
-                self._last_attempt_start = time.time()
+                attempt_started = start_phase()
                 try:
                     source_text = adapter.name
                             
@@ -881,7 +1175,39 @@ class DownloadEngine:
                         logger.info(
                             f"  \U0001f501 [Retry {attempt}] [{track_index}/{track_total}] {track.title} ({source_quality})"
                         )
-                    candidate_path = adapter.download(result, output_base)
+                    progress_started = time.monotonic()
+                    last_progress_emit = 0.0
+
+                    def report_progress(downloaded: int, total_bytes: Optional[int], phase: str = "transferring"):
+                        nonlocal last_progress_emit
+                        now = time.monotonic()
+                        if now - last_progress_emit < 0.2 and (not total_bytes or downloaded < total_bytes):
+                            return
+                        last_progress_emit = now
+                        elapsed = max(0.001, now - progress_started)
+                        percent = (
+                            min(100.0, max(0.0, downloaded * 100.0 / total_bytes))
+                            if total_bytes and total_bytes > 0 else None
+                        )
+                        self._emit(
+                            EngineEventType.TRACK_PROGRESS,
+                            track=track,
+                            track_index=track_index,
+                            track_total=track_total,
+                            phase=phase,
+                            bytes_downloaded=downloaded,
+                            bytes_total=total_bytes,
+                            progress_percent=percent,
+                            speed_bps=downloaded / elapsed,
+                            source=adapter.name,
+                        )
+
+                    adapter.set_download_progress_callback(report_progress)
+                    self._emit_phase("transferring", track, track_index or 0, track_total or 0)
+                    try:
+                        candidate_path = adapter.download(result, output_base)
+                    finally:
+                        adapter.set_download_progress_callback(None)
                     # Probe actual duration before transcoding — used as the
                     # authoritative reference for the truncation check below.
                     # Amazon OPUS streams may be a different edit than the
@@ -939,21 +1265,14 @@ class DownloadEngine:
                         and (self.cfg.output_format or "").lower() in {"lossless", "lossless-24", "flac", "alac", "source", ""}
                         and candidate_path.lower().endswith((".flac", ".m4a"))
                     ):
-                        try:
-                            from mutagen import File as _MF
-                            _audio = _MF(candidate_path)
-                            _actual_bd = getattr(getattr(_audio, "info", None), "bits_per_sample", None)
-                            if _actual_bd and _actual_bd < 24:
-                                self._discard_file(candidate_path)
-                                raise RuntimeError(
-                                    f"[{adapter.name}] Quality mismatch for '{track.title}': "
-                                    f"claimed {claimed_bit_depth}-bit but delivered {_actual_bd}-bit — "
-                                    f"retrying with next source"
-                                )
-                        except RuntimeError:
-                            raise
-                        except Exception:
-                            pass  # Probe failed — accept the file as-is
+                        _actual_bd = self._probe_audio(candidate_path).bit_depth
+                        if _actual_bd and _actual_bd < 24:
+                            self._discard_file(candidate_path)
+                            raise RuntimeError(
+                                f"[{adapter.name}] Quality mismatch for '{track.title}': "
+                                f"claimed {claimed_bit_depth}-bit but delivered {_actual_bd}-bit — "
+                                f"retrying with next source"
+                            )
                     file_path = candidate_path
                     break
                 except Exception as e:
@@ -998,6 +1317,7 @@ class DownloadEngine:
                     break
 
             if file_path:
+                self._emit_phase("processing", track, track_index or 0, track_total or 0)
                 # 4. Enrich metadata from winning adapter + free APIs + lyrics + art
                 pre_enrich_snapshot = self._metadata_debug_snapshot(track)
                 try:
@@ -1006,6 +1326,14 @@ class DownloadEngine:
                 except Exception:
                     self._enrich_track_metadata_if_needed(track)
                     self._enrich_genres_if_needed(track)
+                if lyrics_task is not None:
+                    # Let metadata enrichment overlap the in-flight lyrics request.
+                    # If it supplied a stronger identity, queue one final snapshot
+                    # before joining so tagging still receives the best result.
+                    lyrics_task.retry_with(track)
+                    lyrics_started = start_phase()
+                    lyrics_task.finish(track)
+                    log_phase(logger, "lyrics wait", lyrics_started, subject=track.title)
                 self._log_pre_tag_metadata_diagnostics(
                     track,
                     result,
@@ -1036,12 +1364,7 @@ class DownloadEngine:
                 # Persist a successful delivery so this adapter is preferred within
                 # its tier on future downloads / sessions (SF-1).
                 self.resolver.record_outcome(adapter.name, True)
-                actual_bit_depth = None
-                try:
-                    audio = MutagenFile(file_path)
-                    actual_bit_depth = getattr(getattr(audio, "info", None), "bits_per_sample", None)
-                except Exception:
-                    pass
+                actual_bit_depth = self._probe_audio(file_path).bit_depth
                 self.resolver.record_album_source_success(
                     track,
                     adapter.name,
@@ -1049,9 +1372,16 @@ class DownloadEngine:
                     actual_bit_depth=actual_bit_depth,
                 )
 
-                size_mb = os.path.getsize(file_path) / (1024 * 1024) if os.path.exists(file_path) else 0
-                attempt_time = getattr(self, "_last_attempt_start", time.time())
-                elapsed = time.time() - attempt_time
+                elapsed = elapsed_seconds(attempt_started)
+                if elapsed is not None:
+                    size_mb = os.path.getsize(file_path) / (1024 * 1024) if os.path.exists(file_path) else 0
+                    logger.info(
+                        "  [TIMING]  %s transfer+process %.2fs (%.1f MB, %.1f MB/s)",
+                        track.title,
+                        elapsed,
+                        size_mb,
+                        size_mb / max(elapsed, 0.001),
+                    )
                 
                 logger.info(
                     f"  \u2728 [Complete] [{track_index}/{track_total}] {track.title} by {track.artist_string}"
@@ -1171,66 +1501,187 @@ class DownloadEngine:
 
         # results[i] will hold the DownloadResult for tracks[i]
         results: list[Optional[DownloadResult]] = [None] * total
+        job_seed = f"{playlist_name or 'download'}|{time.time_ns()}|{total}"
+        job_id = hashlib.sha256(job_seed.encode("utf-8")).hexdigest()[:16]
+        retry_deadlines: dict[int, float] = {}
+        retry_attempts: dict[int, int] = {}
+        retry_results: dict[int, DownloadResult] = {}
 
-        def _worker(index: int, track: TrackMetadata) -> tuple[int, DownloadResult]:
+        def _worker(index: int, track: TrackMetadata, retry_attempt: int = 0) -> tuple[int, DownloadResult]:
+            self._event_context.job_id = job_id
+            self._event_context.track_id = self._track_event_id(track, index)
             # Abort immediately if the output filesystem was lost by a previous worker.
             if self._output_lost.is_set():
-                return index, DownloadResult(
+                result = DownloadResult(
                     track=track,
                     status=DownloadStatus.FAILED,
-                    error=self._output_lost_message,
+                    error_message=self._output_lost_message,
                 )
+                self._event_context.job_id = None
+                self._event_context.track_id = None
+                return index, result
             slot_acquired = False
             if self.controller:
                 slot_acquired = self.controller.acquire_worker_slot()
                 if not slot_acquired or self.controller.is_cancelled():
-                    return index, DownloadResult(
+                    result = DownloadResult(
                         track=track,
                         status=DownloadStatus.CANCELLED,
-                        error="Cancelled",
+                        error_message="Cancelled",
                     )
+                    self._event_context.job_id = None
+                    self._event_context.track_id = None
+                    return index, result
             try:
                 logger.info(f"[{index + 1}/{total}] {track.artist_string} — {track.title}")
-                self._emit(
-                    EngineEventType.TRACK_STARTED,
-                    track=track,
+                if retry_attempt == 0:
+                    self._emit(
+                        EngineEventType.TRACK_STARTED,
+                        track=track,
+                        track_index=index + 1,
+                        track_total=total,
+                    )
+                return index, self.download_track(
+                    track,
                     track_index=index + 1,
                     track_total=total,
+                    defer_failure=True,
                 )
-                return index, self.download_track(track, track_index=index + 1, track_total=total)
             finally:
                 if self.controller and slot_acquired:
                     self.controller.release_worker_slot()
+                self._event_context.job_id = None
+                self._event_context.track_id = None
 
-        # Park up to eight workers; the controller gates new tracks using the
-        # live setting. Lowering the limit never interrupts an active track.
-        workers = 8 if self.controller else max(1, self.cfg.max_workers)
+        # Park enough threads for this device; the controller gates live starts.
+        workers = self.controller.worker_ceiling if self.controller else max(1, self.cfg.max_workers)
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {pool.submit(_worker, i, track): i for i, track in enumerate(tracks)}
-            for future in as_completed(futures):
+            pending = {}
+            initial_queue = deque(range(total))
+            delayed: list[tuple[float, int, int]] = []
+
+            def finalize_failure(idx: int, result: DownloadResult, attempt: int, exhausted: bool) -> None:
+                self._event_context.job_id = job_id
+                self._event_context.track_id = self._track_event_id(tracks[idx], idx)
+                if exhausted:
+                    self._emit(
+                        EngineEventType.TRACK_RETRY_EXHAUSTED,
+                        track=tracks[idx],
+                        track_index=idx + 1,
+                        track_total=total,
+                        attempt=attempt,
+                        phase="failed",
+                        error=result.error_message,
+                    )
+                self.organizer.mark_failed(tracks[idx], result.error_message or "Download failed")
+                self._emit(
+                    EngineEventType.TRACK_FAILED,
+                    track=tracks[idx],
+                    track_index=idx + 1,
+                    track_total=total,
+                    attempt=attempt,
+                    phase="failed",
+                    error=result.error_message,
+                )
+                results[idx] = result
+                retry_results.pop(idx, None)
+                self._event_context.job_id = None
+                self._event_context.track_id = None
+
+            while pending or delayed or initial_queue:
                 if self.controller and self.controller.is_cancelled():
                     pool.shutdown(wait=False, cancel_futures=True)
                     break
-                try:
-                    idx, result = future.result()
-                    results[idx] = result
-                except OSError as e:
-                    idx = futures[future]
-                    if _is_mount_lost_error(e):
-                        self._signal_output_lost(e)
-                    results[idx] = DownloadResult(
-                        track=tracks[idx],
-                        status=DownloadStatus.FAILED,
-                        error=self._output_lost_message if self._output_lost.is_set() else str(e),
+
+                now = time.monotonic()
+                while len(pending) < workers:
+                    if delayed and delayed[0][0] <= now:
+                        _, idx, attempt = heapq.heappop(delayed)
+                        if now >= retry_deadlines.get(idx, 0):
+                            result = retry_results.get(idx)
+                            if result is not None:
+                                finalize_failure(idx, result, attempt, True)
+                            continue
+                        pending[pool.submit(_worker, idx, tracks[idx], attempt)] = idx
+                        continue
+                    if initial_queue:
+                        idx = initial_queue.popleft()
+                        pending[pool.submit(_worker, idx, tracks[idx], 0)] = idx
+                        continue
+                    break
+
+                timeout = 0.2
+                if delayed:
+                    timeout = max(0.01, min(timeout, delayed[0][0] - time.monotonic()))
+                if not pending:
+                    time.sleep(timeout)
+                    continue
+
+                done, _ = wait(set(pending), timeout=timeout, return_when=FIRST_COMPLETED)
+                for future in done:
+                    idx = pending.pop(future)
+                    try:
+                        _, result = future.result()
+                    except OSError as exc:
+                        if _is_mount_lost_error(exc):
+                            self._signal_output_lost(exc)
+                        result = DownloadResult(
+                            track=tracks[idx],
+                            status=DownloadStatus.FAILED,
+                            error_message=self._output_lost_message if self._output_lost.is_set() else str(exc),
+                        )
+                    except Exception as exc:
+                        logger.warning(f"Worker for track {idx + 1} raised unexpectedly: {exc}")
+                        result = DownloadResult(
+                            track=tracks[idx],
+                            status=DownloadStatus.FAILED,
+                            error_message=str(exc),
+                        )
+
+                    if result.status != DownloadStatus.FAILED:
+                        results[idx] = result
+                        continue
+
+                    category = classify_download_failure(result.error_message or "Download failed")
+                    retryable = category in {
+                        FailureCategory.TRANSIENT,
+                        FailureCategory.NO_MATCH,
+                        FailureCategory.RATE_LIMITED,
+                    }
+                    attempt = retry_attempts.get(idx, 0) + 1
+                    retry_attempts[idx] = attempt
+                    deadline = retry_deadlines.setdefault(
+                        idx,
+                        time.monotonic() + max(0.0, self.cfg.auto_retry_window_seconds),
                     )
-                except Exception as e:
-                    idx = futures[future]
-                    logger.warning(f"Worker for track {idx + 1} raised unexpectedly: {e}")
-                    results[idx] = DownloadResult(
-                        track=tracks[idx],
-                        status=DownloadStatus.FAILED,
-                        error=str(e),
+                    base_retry_delay = max(0.01, self.cfg.auto_retry_backoff_seconds)
+                    base_delay = (
+                        max(15.0, base_retry_delay)
+                        if category == FailureCategory.RATE_LIMITED
+                        else min(60.0, base_retry_delay * (2 ** (attempt - 1)))
                     )
+                    delay = base_delay * random.uniform(0.85, 1.15)
+
+                    self._event_context.job_id = job_id
+                    self._event_context.track_id = self._track_event_id(tracks[idx], idx)
+                    if retryable and time.monotonic() + delay < deadline:
+                        retry_results[idx] = result
+                        heapq.heappush(delayed, (time.monotonic() + delay, idx, attempt))
+                        self._emit(
+                            EngineEventType.TRACK_RETRY_SCHEDULED,
+                            track=tracks[idx],
+                            track_index=idx + 1,
+                            track_total=total,
+                            attempt=attempt,
+                            phase="retry_wait",
+                            error=result.error_message,
+                            retry_after_seconds=delay,
+                            retry_deadline=time.time() + max(0.0, deadline - time.monotonic()),
+                        )
+                    else:
+                        finalize_failure(idx, result, attempt, retryable)
+                    self._event_context.job_id = None
+                    self._event_context.track_id = None
 
         # Fill any slots that were cancelled or never completed
         final: list[DownloadResult] = []
@@ -1239,7 +1690,7 @@ class DownloadEngine:
                 r = DownloadResult(
                     track=tracks[i],
                     status=DownloadStatus.CANCELLED,
-                    error="Cancelled",
+                    error_message="Cancelled",
                 )
             final.append(r)
 

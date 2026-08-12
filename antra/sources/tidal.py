@@ -52,6 +52,7 @@ class TidalAdapter(BaseSourceAdapter):
         refresh_token: str = "",
         session_id: str = "",
         token_type: str = "Bearer",
+        odesli_enricher: Optional[OdesliEnricher] = None,
     ):
         self.email = email
         self.password = password
@@ -69,7 +70,7 @@ class TidalAdapter(BaseSourceAdapter):
         self._mirrors: list[str] = [m.rstrip("/") for m in (mirrors or []) if m]
         # Failure counter per mirror; >= 3 = excluded, 99 = permanently excluded.
         self._mirror_failures: dict[str, int] = {}
-        self._odesli = OdesliEnricher()
+        self._odesli = odesli_enricher or OdesliEnricher()
 
     def is_available(self) -> bool:
         if self._mirrors:
@@ -362,9 +363,7 @@ class TidalAdapter(BaseSourceAdapter):
 
                     with _requests.get(stream_url, stream=True, timeout=60) as r:
                         r.raise_for_status()
-                        with open(final_path, "wb") as f:
-                            for chunk in r.iter_content(65536):
-                                f.write(chunk)
+                        self.write_stream_to_file(r, final_path, 65536)
 
                     logger.info(
                         f"[Tidal] Downloaded via mirror (codec={codec or 'unknown'}, {bit_depth}-bit)"
@@ -499,20 +498,14 @@ class TidalAdapter(BaseSourceAdapter):
             final_path = output_base + final_ext
             os.makedirs(os.path.dirname(final_path), exist_ok=True)
 
-            with open(final_path, "wb") as f:
-                for chunk in r.iter_content(65536):
-                    if chunk:
-                        f.write(chunk)
+            self.write_stream_to_file(r, final_path, 65536)
 
         return final_path
 
     def _stream_url_to_file(self, url: str, path: str) -> None:
         with _requests.get(url, stream=True, timeout=60) as r:
             r.raise_for_status()
-            with open(path, "wb") as f:
-                for chunk in r.iter_content(65536):
-                    if chunk:
-                        f.write(chunk)
+            self.write_stream_to_file(r, path, 65536)
 
     def _download_segments(self, urls: list[str], output_base: str, ext: str) -> str:
         tmp_dir = tempfile.mkdtemp(prefix="antra_tidal_segments_")

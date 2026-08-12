@@ -311,9 +311,14 @@ class DeezerMirrorAdapter(BaseSourceAdapter):
                 raise RuntimeError("[DeezerMirror] Stream relay unavailable (503)")
             r.raise_for_status()
             chunks = []
+            downloaded = 0
+            total_header = r.headers.get("Content-Length")
+            total = int(total_header) if total_header and total_header.isdigit() else None
             for chunk in r.iter_content(_DOWNLOAD_CHUNK):
                 if chunk:
                     chunks.append(chunk)
+                    downloaded += len(chunk)
+                    self.report_download_progress(downloaded, total)
         encrypted = b"".join(chunks)
 
         # Decrypt

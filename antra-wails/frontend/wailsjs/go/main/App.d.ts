@@ -4,7 +4,17 @@ import {main} from '../models';
 
 export function AddHistory(arg1:main.HistoryItem):Promise<void>;
 
+export function AdvanceIPodCapacityUnlock(arg1:main.IPodCapacityUnlockAdvanceRequest):Promise<void>;
+
+export function BrowseIPodLibrary(arg1:main.IPodBrowseRequest):Promise<string>;
+
+export function CancelAutoSync():Promise<void>;
+
 export function CancelDownload():Promise<void>;
+
+export function CancelIPodOperation():Promise<void>;
+
+export function CancelIPodOperationByID(arg1:string):Promise<void>;
 
 export function CaptureSpDC():Promise<void>;
 
@@ -13,6 +23,20 @@ export function CheckSourceHealth(arg1:string):Promise<string>;
 export function ClearHistory():Promise<void>;
 
 export function ConfirmAmazonLogin():Promise<void>;
+
+export function CreateIPodBackup(arg1:string):Promise<void>;
+
+export function CreateIPodSyncPlan(arg1:main.IPodPlanRequest):Promise<string>;
+
+export function CreateManualIPodBackup(arg1:main.IPodManualBackupRequest):Promise<void>;
+
+export function DeleteIPodBackup(arg1:main.IPodBackupDeleteRequest):Promise<void>;
+
+export function EjectIPod(arg1:string):Promise<string>;
+
+export function ExecuteIPodSync(arg1:main.IPodExecuteRequest):Promise<void>;
+
+export function ExportIPodBackup(arg1:main.IPodBackupExportRequest):Promise<void>;
 
 export function GetAppleMusicArtistDetail(arg1:string):Promise<string>;
 
@@ -28,19 +52,37 @@ export function GetDiscoveryData(arg1:string,arg2:string,arg3:string):Promise<st
 
 export function GetDiscoveryGenres(arg1:string):Promise<string>;
 
+export function GetDownloadWorkerCapacity():Promise<number>;
+
 export function GetDownloadedMusicLibrary():Promise<string>;
 
 export function GetDownloadedRelease(arg1:string):Promise<string>;
 
 export function GetHistory():Promise<Array<main.HistoryItem>>;
 
+export function GetIPodBackupSnapshot(arg1:main.IPodBackupSnapshotRequest):Promise<string>;
+
+export function GetIPodCapacityUnlockEligibility(arg1:main.IPodCapacityUnlockEligibilityRequest):Promise<string>;
+
 export function GetIPodDevices():Promise<string>;
+
+export function GetIPodRecoveryState():Promise<string>;
+
+export function GetIPodSyncPlanDetails(arg1:main.IPodPlanDetailsRequest):Promise<string>;
 
 export function GetSpotifyStatus():Promise<string>;
 
 export function GetSuggestedDownloadLocation(arg1:string):Promise<string>;
 
+export function GetThirdPartyNotices():Promise<string>;
+
 export function GetTrackLyrics(arg1:string):Promise<string>;
+
+export function InspectIPodRecoveryUSB():Promise<main.IPodRecoveryUSBInspection>;
+
+export function ListIPodBackupDevices():Promise<string>;
+
+export function ListIPodBackupSnapshots(arg1:main.IPodBackupSnapshotsRequest):Promise<string>;
 
 export function LoginSpotify():Promise<string>;
 
@@ -50,6 +92,12 @@ export function PauseDownload():Promise<void>;
 
 export function PickDirectory():Promise<string>;
 
+export function PickIPodRecoveryFile():Promise<string>;
+
+export function PreflightIPodMigration(arg1:main.IPodMigrationPreflightRequest):Promise<string>;
+
+export function PreflightIPodRestore(arg1:main.IPodRestorePreflightRequest):Promise<string>;
+
 export function RefreshAppleMusicLibrary():Promise<string>;
 
 export function RefreshDownloadedMusicLibrary():Promise<string>;
@@ -58,13 +106,13 @@ export function ResetAppleMusicIndex():Promise<void>;
 
 export function ResumeDownload():Promise<void>;
 
-export function RetryTrackDownload(arg1:string):Promise<void>;
-
 export function RunAutoSync():Promise<string>;
 
 export function SaveConfig(arg1:main.Config):Promise<void>;
 
 export function SaveCoverArt(arg1:string,arg2:string):Promise<string>;
+
+export function ScanIPodDevices():Promise<string>;
 
 export function SearchArtists(arg1:string,arg2:string):Promise<string>;
 
@@ -74,6 +122,8 @@ export function SetSpotifyCookie(arg1:string):Promise<string>;
 
 export function SetSpotifyToken(arg1:string):Promise<string>;
 
+export function StageDownloadsForIPod(arg1:main.IPodStageRequest):Promise<string>;
+
 export function StartAmazonBrowserLogin():Promise<void>;
 
 export function StartAppleBrowserLogin():Promise<void>;
@@ -82,6 +132,20 @@ export function StartAppleMusicIndex():Promise<void>;
 
 export function StartDownload(arg1:Array<string>):Promise<void>;
 
+export function StartIPodCapacityUnlock(arg1:main.IPodCapacityUnlockStartRequest):Promise<void>;
+
+export function StartIPodMigration(arg1:main.IPodMigrationRequest):Promise<void>;
+
+export function StartIPodRestore(arg1:main.IPodRestoreRequest):Promise<void>;
+
+export function StartIPodWatcher():Promise<void>;
+
 export function StartTidalOAuthLogin():Promise<void>;
 
+export function StopIPodWatcher():Promise<void>;
+
+export function UpdateIPodBackupNote(arg1:main.IPodBackupNoteRequest):Promise<void>;
+
 export function ValidateTidalAuth():Promise<string>;
+
+export function VerifyIPodBackup(arg1:main.IPodBackupVerifyRequest):Promise<string>;

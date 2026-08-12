@@ -197,6 +197,13 @@ class NetEaseAdapter(BaseSourceAdapter):
         # Use a unique temp stem to avoid collisions
         tmp_stem = os.path.join(tmp_dir, f"_ne_tmp_{result.stream_id}")
 
+        def progress_hook(status: dict) -> None:
+            if status.get("status") not in {"downloading", "finished"}:
+                return
+            downloaded = int(status.get("downloaded_bytes") or 0)
+            total = status.get("total_bytes") or status.get("total_bytes_estimate")
+            self.report_download_progress(downloaded, int(total) if total else None)
+
         ydl_opts = {
             "format": "bestaudio",
             "outtmpl": tmp_stem + ".%(ext)s",
@@ -204,6 +211,7 @@ class NetEaseAdapter(BaseSourceAdapter):
             "no_warnings": True,
             "noplaylist": True,
             "retries": 3,
+            "progress_hooks": [progress_hook],
         }
 
         try:

@@ -22,7 +22,26 @@ import (
 	wailsRuntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
+const currentConfigSchemaVersion = 2
+
+type UIConfig struct {
+	Scale                     float64 `json:"scale"`
+	Density                   string  `json:"density"`
+	SidebarWidth              int     `json:"sidebar_width"`
+	ArtworkSize               int     `json:"artwork_size"`
+	Motion                    string  `json:"motion"`
+	PlayerVolume              float64 `json:"player_volume"`
+	StartupDestination        string  `json:"startup_destination"`
+	RememberLastPage          bool    `json:"remember_last_page"`
+	OpenDownloadsOnAdd        bool    `json:"open_downloads_on_add"`
+	CompletionNotifications   bool    `json:"completion_notifications"`
+	DeviceNotifications       bool    `json:"device_notifications"`
+	CompletedHistoryRetention int     `json:"completed_history_retention"`
+}
+
 type Config struct {
+	ConfigSchemaVersion         int           `json:"config_schema_version"`
+	UI                          *UIConfig     `json:"ui,omitempty"`
 	DownloadPath                string        `json:"download_path"`
 	DownloadPathIsLibraryRoot   bool          `json:"download_path_is_library_root,omitempty"`
 	AppleEnabled                bool          `json:"apple_enabled"`
@@ -86,17 +105,139 @@ type Config struct {
 	TrackedPlaylists            []interface{} `json:"tracked_playlists,omitempty"`
 }
 
+func defaultUIConfig() UIConfig {
+	return UIConfig{
+		Scale:                     1,
+		Density:                   "comfortable",
+		SidebarWidth:              240,
+		ArtworkSize:               170,
+		Motion:                    "system",
+		PlayerVolume:              0.8,
+		StartupDestination:        "recently-added",
+		RememberLastPage:          true,
+		OpenDownloadsOnAdd:        true,
+		CompletionNotifications:   true,
+		DeviceNotifications:       true,
+		CompletedHistoryRetention: 100,
+	}
+}
+
+func clampFloat(value, min, max float64) float64 {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func clampInt(value, min, max int) int {
+	if value < min {
+		return min
+	}
+	if value > max {
+		return max
+	}
+	return value
+}
+
+func oneOf(value string, fallback string, allowed ...string) string {
+	for _, candidate := range allowed {
+		if value == candidate {
+			return value
+		}
+	}
+	return fallback
+}
+
+// normalizeConfig is the single migration/default/clamping path used for both
+// reads and writes. The raw payload is retained only to distinguish absent
+// legacy booleans from explicit false values.
+func normalizeConfig(cfg Config, raw []byte) Config {
+	defaults := defaultUIConfig()
+	if cfg.UI == nil {
+		cfg.UI = &defaults
+	} else {
+		ui := *cfg.UI
+		if ui.Scale == 0 {
+			ui.Scale = defaults.Scale
+		}
+		ui.Scale = clampFloat(ui.Scale, 0.85, 1.25)
+		ui.Density = oneOf(ui.Density, defaults.Density, "compact", "comfortable", "spacious")
+		if ui.SidebarWidth == 0 {
+			ui.SidebarWidth = defaults.SidebarWidth
+		}
+		ui.SidebarWidth = clampInt(ui.SidebarWidth, 210, 300)
+		if ui.ArtworkSize == 0 {
+			ui.ArtworkSize = defaults.ArtworkSize
+		}
+		ui.ArtworkSize = clampInt(ui.ArtworkSize, 130, 210)
+		ui.Motion = oneOf(ui.Motion, defaults.Motion, "system", "reduced", "full")
+		if !bytes.Contains(raw, []byte(`"player_volume"`)) {
+			ui.PlayerVolume = defaults.PlayerVolume
+		} else if ui.PlayerVolume < 0 || ui.PlayerVolume > 1 {
+			ui.PlayerVolume = clampFloat(ui.PlayerVolume, 0, 1)
+		}
+		ui.StartupDestination = oneOf(
+			ui.StartupDestination,
+			defaults.StartupDestination,
+			"recently-added", "albums", "playlists", "favourites", "artists", "downloaded", "downloads",
+		)
+		if !bytes.Contains(raw, []byte(`"remember_last_page"`)) {
+			ui.RememberLastPage = defaults.RememberLastPage
+		}
+		if !bytes.Contains(raw, []byte(`"open_downloads_on_add"`)) {
+			ui.OpenDownloadsOnAdd = defaults.OpenDownloadsOnAdd
+		}
+		if !bytes.Contains(raw, []byte(`"completion_notifications"`)) {
+			ui.CompletionNotifications = defaults.CompletionNotifications
+		}
+		if !bytes.Contains(raw, []byte(`"device_notifications"`)) {
+			ui.DeviceNotifications = defaults.DeviceNotifications
+		}
+		if ui.CompletedHistoryRetention == 0 {
+			ui.CompletedHistoryRetention = defaults.CompletedHistoryRetention
+		}
+		ui.CompletedHistoryRetention = clampInt(ui.CompletedHistoryRetention, 10, 1000)
+		cfg.UI = &ui
+	}
+
+	cfg.Theme = oneOf(strings.ToLower(strings.TrimSpace(cfg.Theme)), "system", "system", "light", "dark")
+	cfg.ConfigSchemaVersion = currentConfigSchemaVersion
+	return cfg
+}
+
+func downloadWorkerCeiling() int {
+	return downloadWorkerCeilingForCPU(runtime.NumCPU())
+}
+
+func downloadWorkerCeilingForCPU(cpus int) int {
+	if cpus <= 4 {
+		return 8
+	}
+	if cpus <= 8 {
+		return 12
+	}
+	return 16
+}
+
+func (a *App) GetDownloadWorkerCapacity() int {
+	return downloadWorkerCeiling()
+}
+
 type HistoryItem struct {
-	Date       string         `json:"date"`
-	URL        string         `json:"url"`
-	Title      string         `json:"title,omitempty"`
-	ArtworkUrl string         `json:"artwork_url,omitempty"`
-	Total      int            `json:"total"`
-	Downloaded int            `json:"downloaded"`
-	Failed     int            `json:"failed"`
-	Skipped    int            `json:"skipped"`
-	Error      string         `json:"error,omitempty"`
-	Sources    map[string]int `json:"sources"`
+	Date           string         `json:"date"`
+	URL            string         `json:"url"`
+	Title          string         `json:"title,omitempty"`
+	ArtworkUrl     string         `json:"artwork_url,omitempty"`
+	Total          int            `json:"total"`
+	Downloaded     int            `json:"downloaded"`
+	Failed         int            `json:"failed"`
+	Skipped        int            `json:"skipped"`
+	Error          string         `json:"error,omitempty"`
+	Sources        map[string]int `json:"sources"`
+	CompletedFiles []string       `json:"completed_files,omitempty"`
 }
 
 func getAppDataDir() string {
@@ -143,8 +284,79 @@ func (a *App) GetSuggestedDownloadLocation(kind string) string {
 	return filepath.Join(home, "Music", "Vela")
 }
 
-// GetConfig returns the application configuration
+func cloneConfig(cfg Config) Config {
+	cloned := cfg
+	if cfg.UI != nil {
+		ui := *cfg.UI
+		cloned.UI = &ui
+	}
+	cloned.SourcesEnabled = append([]string(nil), cfg.SourcesEnabled...)
+	cloned.DownloadSources = append([]string(nil), cfg.DownloadSources...)
+	if cfg.TrackedPlaylists != nil {
+		cloned.TrackedPlaylists = make([]interface{}, len(cfg.TrackedPlaylists))
+		for index, entry := range cfg.TrackedPlaylists {
+			cloned.TrackedPlaylists[index] = cloneConfigValue(entry)
+		}
+	}
+	return cloned
+}
+
+func cloneConfigValue(value interface{}) interface{} {
+	switch typed := value.(type) {
+	case map[string]interface{}:
+		cloned := make(map[string]interface{}, len(typed))
+		for key, item := range typed {
+			cloned[key] = cloneConfigValue(item)
+		}
+		return cloned
+	case []interface{}:
+		cloned := make([]interface{}, len(typed))
+		for index, item := range typed {
+			cloned[index] = cloneConfigValue(item)
+		}
+		return cloned
+	case []string:
+		return append([]string(nil), typed...)
+	default:
+		return value
+	}
+}
+
+// GetConfig returns a detached copy of the lazily cached, normalized
+// application configuration.
 func (a *App) GetConfig() Config {
+	a.configMu.RLock()
+	if a.configCacheReady {
+		cfg := cloneConfig(a.configCache)
+		a.configMu.RUnlock()
+		return cfg
+	}
+	a.configMu.RUnlock()
+
+	a.configMu.Lock()
+	defer a.configMu.Unlock()
+	if !a.configCacheReady {
+		a.configCache = cloneConfig(a.loadConfigFromDisk())
+		a.configCacheReady = true
+	}
+	return cloneConfig(a.configCache)
+}
+
+func (a *App) replaceConfigCache(cfg Config) {
+	a.configMu.Lock()
+	a.configCache = cloneConfig(cfg)
+	a.configCacheReady = true
+	a.configMu.Unlock()
+}
+
+func (a *App) invalidateConfigCache() {
+	a.configMu.Lock()
+	a.configCache = Config{}
+	a.configCacheReady = false
+	a.configMu.Unlock()
+}
+
+func (a *App) loadConfigFromDisk() Config {
 	var cfg Config
 	cfgPath := getConfigPath()
 	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
@@ -155,6 +367,7 @@ func (a *App) GetConfig() Config {
 		cfg.DownloadPath = filepath.Join(userProfile, "Music", "Vela")
 		cfg.DownloadPathIsLibraryRoot = true
 		cfg.MaxRetries = 3
+		cfg.MaxConcurrentJobs = 2
 		cfg.AppleStorefront = "gb"
 		cfg.QobuzAppID = "285473059"
 		cfg.DeezerBFSecret = "g4el58wc0zvf9na1"
@@ -173,14 +386,17 @@ func (a *App) GetConfig() Config {
 		cfg.SaveCoverArtSidecar = true
 		cfg.DownloadSource = "auto"
 		cfg.DownloadSources = []string{"auto"}
-		return cfg
+		return normalizeConfig(cfg, nil)
+	}
+	if err := ensurePrivateConfigPermissions(cfgPath); err != nil {
+		a.logWarningf("Failed to restrict config permissions: %v", err)
 	}
 
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		wailsRuntime.LogErrorf(a.ctx, "Failed to read config: %v", err)
 		cfg.DownloadPath = defaultVelaMusicPath()
-		return cfg
+		return normalizeConfig(cfg, nil)
 	}
 
 	json.Unmarshal(data, &cfg)
@@ -211,6 +427,12 @@ func (a *App) GetConfig() Config {
 	}
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 3
+	}
+	if cfg.MaxConcurrentJobs < 1 {
+		cfg.MaxConcurrentJobs = 2
+	}
+	if cfg.MaxConcurrentJobs > downloadWorkerCeiling() {
+		cfg.MaxConcurrentJobs = downloadWorkerCeiling()
 	}
 	if cfg.AppleStorefront == "" {
 		cfg.AppleStorefront = "gb"
@@ -260,15 +482,26 @@ func (a *App) GetConfig() Config {
 	if len(cfg.DownloadSources) == 0 {
 		cfg.DownloadSources = []string{cfg.DownloadSource}
 	}
-	return cfg
+	return normalizeConfig(cfg, data)
 }
 
 // SaveConfig saves the configuration and marks first run as complete
 func (a *App) SaveConfig(cfg Config) error {
+	a.configWriteMu.Lock()
+	defer a.configWriteMu.Unlock()
+
 	cfg.FirstRunComplete = true
 	cfg.DownloadPathIsLibraryRoot = true
+	raw, _ := json.Marshal(cfg)
+	cfg = normalizeConfig(cfg, raw)
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 3
+	}
+	if cfg.MaxConcurrentJobs < 1 {
+		cfg.MaxConcurrentJobs = 2
+	}
+	if cfg.MaxConcurrentJobs > downloadWorkerCeiling() {
+		cfg.MaxConcurrentJobs = downloadWorkerCeiling()
 	}
 	if cfg.AppleStorefront == "" {
 		cfg.AppleStorefront = "gb"
@@ -328,7 +561,36 @@ func (a *App) SaveConfig(cfg Config) error {
 		return err
 	}
 
-	return os.WriteFile(getConfigPath(), data, 0644)
+	temp, err := os.CreateTemp(dir, "config-*.tmp")
+	if err != nil {
+		return err
+	}
+	tempName := temp.Name()
+	defer os.Remove(tempName)
+	if err := temp.Chmod(0600); err != nil {
+		temp.Close()
+		return err
+	}
+	if _, err := temp.Write(data); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Sync(); err != nil {
+		temp.Close()
+		return err
+	}
+	if err := temp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tempName, getConfigPath()); err != nil {
+		return err
+	}
+	if err := ensurePrivateConfigPermissions(getConfigPath()); err != nil {
+		a.invalidateConfigCache()
+		return err
+	}
+	a.replaceConfigCache(cfg)
+	return nil
 }
 
 // GetHistory returns the application history
@@ -352,10 +614,20 @@ func (a *App) GetHistory() []HistoryItem {
 
 // AddHistory appends a new run to the history file
 func (a *App) AddHistory(item HistoryItem) error {
+	item.CompletedFiles = validatedCompletedLibraryFiles(
+		item.CompletedFiles,
+		a.GetConfig().DownloadPath,
+	)
 	history := a.GetHistory()
 	history = append([]HistoryItem{item}, history...) // prepend
 
-	// Keep history bounded if needed, here keeping all for now.
+	retention := defaultUIConfig().CompletedHistoryRetention
+	if ui := a.GetConfig().UI; ui != nil {
+		retention = ui.CompletedHistoryRetention
+	}
+	if len(history) > retention {
+		history = history[:retention]
+	}
 	data, err := json.MarshalIndent(history, "", "  ")
 	if err != nil {
 		return err
@@ -364,6 +636,47 @@ func (a *App) AddHistory(item HistoryItem) error {
 	dir := getAppDataDir()
 	os.MkdirAll(dir, 0755)
 	return os.WriteFile(getHistoryPath(), data, 0644)
+}
+
+func validatedCompletedLibraryFiles(paths []string, libraryRoot string) []string {
+	root, err := filepath.Abs(strings.TrimSpace(libraryRoot))
+	if err != nil || root == "" {
+		return nil
+	}
+	if resolved, resolveErr := filepath.EvalSymlinks(root); resolveErr == nil {
+		root = resolved
+	}
+	root = filepath.Clean(root)
+	result := make([]string, 0, len(paths))
+	seen := make(map[string]bool)
+	for _, candidate := range paths {
+		path, pathErr := filepath.Abs(strings.TrimSpace(candidate))
+		if pathErr != nil {
+			continue
+		}
+		if resolved, resolveErr := filepath.EvalSymlinks(path); resolveErr == nil {
+			path = resolved
+		}
+		path = filepath.Clean(path)
+		relative, relativeErr := filepath.Rel(root, path)
+		if relativeErr != nil || relative == "." || relative == ".." ||
+			strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+			continue
+		}
+		info, statErr := os.Stat(path)
+		if statErr != nil || !info.Mode().IsRegular() {
+			continue
+		}
+		key := path
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(key)
+		}
+		if !seen[key] {
+			seen[key] = true
+			result = append(result, path)
+		}
+	}
+	return result
 }
 
 // ClearHistory deletes history
@@ -419,8 +732,8 @@ func (a *App) writeDownloadControl(paused bool, workers int) error {
 	if workers < 1 {
 		workers = 1
 	}
-	if workers > 8 {
-		workers = 8
+	if workers > downloadWorkerCeiling() {
+		workers = downloadWorkerCeiling()
 	}
 	if err := os.MkdirAll(getAppDataDir(), 0755); err != nil {
 		return err
@@ -455,7 +768,7 @@ func (a *App) PauseDownload() error {
 	cancel, cmd := a.detachActiveDownload()
 	if cmd != nil {
 		if err := killCommandTree(cmd); err != nil {
-			wailsRuntime.LogWarningf(a.ctx, "Failed to pause library engine immediately: %v", err)
+			a.logWarningf("Failed to pause library engine immediately: %v", err)
 		}
 	}
 	if cancel != nil {
@@ -479,31 +792,14 @@ func (a *App) SetDownloadWorkerCount(workers int) error {
 // StartDownload starts the Python backend process and streams output
 func (a *App) StartDownload(playlists []string) error {
 	wailsRuntime.LogInfof(a.ctx, "Starting download for: %v", playlists)
-
-	// Library indexing is intentionally lower priority than an explicit user
-	// download. Running both Python engines at once can exhaust network sockets,
-	// provider rate limits, and disk bandwidth, making the whole backend appear
-	// frozen. Checkpoint the index and resume it after the download exits.
-	a.mu.Lock()
-	indexCmd := a.indexCmd
-	if indexCmd != nil {
-		a.indexCmd = nil
-		a.indexRestartAfterDownload = true
-	}
-	a.mu.Unlock()
-	if indexCmd != nil {
-		_ = killCommandTree(indexCmd)
-		wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
-			"type": "apple_index_paused", "label": "Index paused while downloading",
-		})
-	}
+	releaseLibraryResources := a.beginExplicitLibraryWork()
 
 	if cancel, cmd := a.detachActiveDownload(); cancel != nil || cmd != nil {
 		if cancel != nil {
 			cancel()
 		}
 		if err := killCommandTree(cmd); err != nil {
-			wailsRuntime.LogWarningf(a.ctx, "Failed to stop previous library engine: %v", err)
+			a.logWarningf("Failed to stop previous library engine: %v", err)
 		}
 	}
 
@@ -519,13 +815,21 @@ func (a *App) StartDownload(playlists []string) error {
 	command, args, workDir, env, err := a.resolveBackendCommand(playlists)
 	if err != nil {
 		cancel()
+		releaseLibraryResources()
 		wailsRuntime.LogErrorf(a.ctx, err.Error())
-		a.resumeDeferredAppleIndex()
 		return err
 	}
 
-	if err := a.startBackendProcess(ctx, cancel, command, args, workDir, env); err != nil {
-		a.resumeDeferredAppleIndex()
+	if err := a.startBackendProcess(
+		ctx,
+		cancel,
+		command,
+		args,
+		workDir,
+		env,
+		releaseLibraryResources,
+	); err != nil {
+		releaseLibraryResources()
 		return err
 	}
 	return nil
@@ -547,39 +851,6 @@ func (a *App) resumeDeferredAppleIndex() {
 	}
 }
 
-func (a *App) RetryTrackDownload(trackJSON string) error {
-	if strings.TrimSpace(trackJSON) == "" {
-		return fmt.Errorf("retry track payload is empty")
-	}
-
-	wailsRuntime.LogInfof(a.ctx, "Retrying failed track")
-
-	if cancel, cmd := a.detachActiveDownload(); cancel != nil || cmd != nil {
-		if cancel != nil {
-			cancel()
-		}
-		if err := killCommandTree(cmd); err != nil {
-			wailsRuntime.LogWarningf(a.ctx, "Failed to stop previous library engine: %v", err)
-		}
-	}
-
-	a.mu.Lock()
-	a.isStopping = false
-	a.mu.Unlock()
-
-	ctx, cancel := context.WithCancel(a.ctx)
-	command, baseArgs, workDir, env, err := a.resolveBackendCommand([]string{})
-	if err != nil {
-		cancel()
-		wailsRuntime.LogErrorf(a.ctx, err.Error())
-		return err
-	}
-
-	args := append([]string{}, baseArgs...)
-	args = append(args, "--retry-track-json", trackJSON)
-	return a.startBackendProcess(ctx, cancel, command, args, workDir, env)
-}
-
 func (a *App) startBackendProcess(
 	ctx context.Context,
 	cancel context.CancelFunc,
@@ -587,8 +858,9 @@ func (a *App) startBackendProcess(
 	args []string,
 	workDir string,
 	env []string,
+	releaseLibraryResources func(),
 ) error {
-
+	processSpan := a.beginBackendPerf("download")
 	cmd := exec.CommandContext(ctx, command, args...)
 	hideProcess(cmd)
 	cmd.Dir = workDir
@@ -597,22 +869,31 @@ func (a *App) startBackendProcess(
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()
+		processSpan.finish(0, err)
 		return err
 	}
 	cmd.Stderr = cmd.Stdout // merge stderr into stdout for parsing
 
+	spawnSpan := a.beginPerf("backend.download_spawn")
 	if err := cmd.Start(); err != nil {
 		cancel()
+		spawnSpan.finish(0, err)
+		processSpan.finish(0, err)
 		return err
 	}
+	a.incrementPerf("backend_spawns")
+	spawnSpan.finish(0, nil)
 	a.attachActiveDownload(cancel, cmd)
 
 	go func() {
+		defer releaseLibraryResources()
 		scanner := bufio.NewScanner(stdout)
+		outputBytes := 0
 		// Large playlist metadata events can exceed Scanner's default 64 KiB cap.
 		// Raise it so 1000+ track payloads still reach the frontend intact.
 		scanner.Buffer(make([]byte, 64*1024), 16*1024*1024)
 		for scanner.Scan() {
+			outputBytes += len(scanner.Bytes()) + 1
 			a.mu.Lock()
 			stopping := a.isStopping
 			a.mu.Unlock()
@@ -663,6 +944,7 @@ func (a *App) startBackendProcess(
 
 		scanErr := scanner.Err()
 		err := cmd.Wait()
+		processSpan.finish(outputBytes, errors.Join(scanErr, err))
 		a.clearActiveDownload(cmd)
 
 		status := "completed"
@@ -783,29 +1065,24 @@ func shouldHideLogMessage(msg string) bool {
 	return false
 }
 
-func killCommandTree(cmd *exec.Cmd) error {
-	if cmd == nil || cmd.Process == nil {
-		return nil
+func (a *App) backendOutput(name string, cmd *exec.Cmd) ([]byte, error) {
+	span := a.beginBackendPerf(name)
+	output, err := cmd.Output()
+	if cmd.Process != nil {
+		a.incrementPerf("backend_spawns")
 	}
+	span.finish(len(output), err)
+	return output, err
+}
 
-	if runtime.GOOS == "windows" {
-		killer := exec.Command("taskkill", "/PID", fmt.Sprintf("%d", cmd.Process.Pid), "/T", "/F")
-		hideProcess(killer)
-		output, err := killer.CombinedOutput()
-		if err != nil {
-			text := strings.ToLower(string(output))
-			if strings.Contains(text, "not found") || strings.Contains(text, "no running instance") {
-				return nil
-			}
-			return fmt.Errorf("taskkill failed: %v (%s)", err, strings.TrimSpace(string(output)))
-		}
-		return nil
+func (a *App) backendCombinedOutput(name string, cmd *exec.Cmd) ([]byte, error) {
+	span := a.beginBackendPerf(name)
+	output, err := cmd.CombinedOutput()
+	if cmd.Process != nil {
+		a.incrementPerf("backend_spawns")
 	}
-
-	if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) {
-		return err
-	}
-	return nil
+	span.finish(len(output), err)
+	return output, err
 }
 
 func (a *App) runPythonCommand(args []string) (string, error) {
@@ -827,7 +1104,7 @@ func (a *App) runPythonCommand(args []string) (string, error) {
 	cmd.Env = env
 	hideProcess(cmd)
 
-	output, err := cmd.CombinedOutput()
+	output, err := a.backendCombinedOutput("python_command", cmd)
 	if err != nil {
 		return string(output), err
 	}
@@ -1037,55 +1314,16 @@ func (a *App) GetArtistDiscography(artistUrl string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 
-	backend, err := ensureBundledBackend()
+	out, err := a.callReadOnlyHelper(ctx, "artist_discography", map[string]interface{}{
+		"artist_url": artistUrl,
+	})
 	if err != nil {
-		// Dev fallback: run via python source
-		return a.getArtistDiscographyViaPython(ctx, artistUrl)
-	}
-
-	cmd := exec.CommandContext(ctx, backend, "--discography", artistUrl, "--config", getConfigPath())
-	hideProcess(cmd)
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(err, context.DeadlineExceeded) {
 			return `{"error":"timed out fetching discography (60s)"}`
 		}
-		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+		return jsonError(err)
 	}
-	return unwrapDiscographyJSON(out)
-}
-
-func (a *App) getArtistDiscographyViaPython(ctx context.Context, artistUrl string) string {
-	pythonExe, _, workDir, env, err := a.resolveBackendCommand([]string{})
-	if err != nil {
-		return `{"error":"could not resolve backend"}`
-	}
-	cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--discography", artistUrl, "--config", getConfigPath())
-	cmd.Dir = workDir
-	cmd.Env = env
-	hideProcess(cmd)
-	out, err := cmd.Output()
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			return `{"error":"timed out fetching discography (60s)"}`
-		}
-		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
-	}
-	return unwrapDiscographyJSON(out)
-}
-
-// unwrapDiscographyJSON unpacks {"type":"discography","data":{...}} → just the data object.
-func unwrapDiscographyJSON(out []byte) string {
-	var wrapper map[string]interface{}
-	if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &wrapper); jsonErr != nil {
-		return string(out)
-	}
-	if wrapper["type"] == "error" {
-		msg, _ := wrapper["message"].(string)
-		return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
-	}
-	result, _ := json.Marshal(wrapper["data"])
-	return string(result)
+	return string(out)
 }
 
 // GetSpotifyLibrary returns the user's Spotify library (Liked Songs + playlists).
@@ -1107,6 +1345,17 @@ func (a *App) RefreshAppleMusicLibrary() string {
 func (a *App) getAppleMusicLibrary(forceRefresh bool) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
 	defer cancel()
+	if !forceRefresh {
+		out, err := a.callReadOnlyHelper(ctx, "apple_library", map[string]interface{}{})
+		if err != nil {
+			if errors.Is(err, context.DeadlineExceeded) {
+				return `{"error":"timed out fetching Apple Music library (35s)"}`
+			}
+			return jsonError(err)
+		}
+		return string(out)
+	}
+
 	flag := "--apple-library"
 	if forceRefresh {
 		flag = "--apple-library-refresh"
@@ -1119,7 +1368,7 @@ func (a *App) getAppleMusicLibrary(forceRefresh bool) string {
 
 	cmd := exec.CommandContext(ctx, backend, flag, "--config", getConfigPath())
 	hideProcess(cmd)
-	out, err := cmd.Output()
+	out, err := a.backendOutput("apple_library", cmd)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return `{"error":"timed out fetching Apple Music library (35s)"}`
@@ -1138,7 +1387,7 @@ func (a *App) getAppleMusicLibraryViaPython(ctx context.Context, flag string) st
 	cmd.Dir = workDir
 	cmd.Env = env
 	hideProcess(cmd)
-	out, err := cmd.Output()
+	out, err := a.backendOutput("apple_library_dev", cmd)
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
 			return `{"error":"timed out fetching Apple Music library (35s)"}`
@@ -1154,63 +1403,51 @@ func (a *App) GetAppleMusicPlaylistDetail(libraryURL string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
 
-	backend, err := ensureBundledBackend()
-	if err == nil {
-		cmd := exec.CommandContext(ctx, backend, "--apple-library-detail", libraryURL, "--config", getConfigPath())
-		hideProcess(cmd)
-		out, runErr := cmd.Output()
-		if runErr == nil {
-			return parseLibraryOutput(out, "apple_library_detail")
-		}
-	}
-
-	pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
-	if resolveErr != nil {
-		return `{"error":"could not resolve backend"}`
-	}
-	cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--apple-library-detail", libraryURL, "--config", getConfigPath())
-	cmd.Dir = workDir
-	cmd.Env = env
-	hideProcess(cmd)
-	out, runErr := cmd.Output()
-	if runErr != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+	out, err := a.callReadOnlyHelper(ctx, "apple_library_detail", map[string]interface{}{
+		"library_url": libraryURL,
+	})
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
 			return `{"error":"timed out loading playlist tracks"}`
 		}
-		return `{"error":"` + strings.ReplaceAll(runErr.Error(), `"`, `'`) + `"}`
+		return jsonError(err)
 	}
-	return parseLibraryOutput(out, "apple_library_detail")
+	return string(out)
 }
 
 func (a *App) GetAppleMusicArtistDetail(artistName string) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	if backend, err := ensureBundledBackend(); err == nil {
-		cmd := exec.CommandContext(ctx, backend, "--apple-library-artist", artistName, "--config", getConfigPath())
-		hideProcess(cmd)
-		if out, runErr := cmd.Output(); runErr == nil {
-			return parseLibraryOutput(out, "apple_library_detail")
-		}
-	}
-	pythonExe, _, workDir, env, err := a.resolveBackendCommand([]string{})
+	out, err := a.callReadOnlyHelper(ctx, "apple_library_artist", map[string]interface{}{
+		"artist_name": artistName,
+	})
 	if err != nil {
-		return `{"error":"could not resolve backend"}`
-	}
-	cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--apple-library-artist", artistName, "--config", getConfigPath())
-	cmd.Dir = workDir
-	cmd.Env = env
-	hideProcess(cmd)
-	out, runErr := cmd.Output()
-	if runErr != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return `{"error":"timed out reading indexed artist"}`
+		}
 		return `{"error":"could not read indexed artist"}`
 	}
-	return parseLibraryOutput(out, "apple_library_detail")
+	return string(out)
 }
 
 // StartAppleMusicIndex resumes a checkpointed, local-first index of every
 // Apple Music release and track. Closing the app stops the process; cached
 // releases are skipped when it starts again.
 func (a *App) StartAppleMusicIndex() error {
+	a.libraryIndexCoordinator().schedule(backgroundIndexApple, func(ctx context.Context) {
+		if err := a.runAppleMusicIndex(ctx); err != nil && !errors.Is(err, context.Canceled) {
+			wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
+				"type": "apple_index_error", "message": fmt.Sprintf("Could not index Apple Music: %v", err),
+			})
+		}
+	})
+	return nil
+}
+
+func (a *App) runAppleMusicIndex(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	a.mu.Lock()
 	if a.indexCmd != nil {
 		a.mu.Unlock()
@@ -1222,68 +1459,95 @@ func (a *App) StartAppleMusicIndex() error {
 	if err != nil {
 		return err
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	args = append(args, "--apple-library-index")
+	processSpan := a.beginBackendPerf("apple_index")
 	cmd := exec.Command(command, args...)
 	hideProcess(cmd)
 	cmd.Dir = workDir
 	cmd.Env = env
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		processSpan.finish(0, err)
 		return err
 	}
 	cmd.Stderr = cmd.Stdout
 	if err := cmd.Start(); err != nil {
+		processSpan.finish(0, err)
 		return err
 	}
+	a.incrementPerf("backend_spawns")
 	a.mu.Lock()
 	a.indexCmd = cmd
 	a.mu.Unlock()
+	watchDone := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = killCommandTree(cmd)
+		case <-watchDone:
+		}
+	}()
 	wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
 		"type": "apple_index_progress", "completed": 0, "total": 1,
 		"percent": 0, "release_completed": 0, "release_total": 0,
 		"label": "Reading local library index",
 	})
 
-	go func() {
-		scanner := bufio.NewScanner(stdout)
-		scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
-		terminalSeen := false
-		for scanner.Scan() {
-			var payload map[string]interface{}
-			if json.Unmarshal([]byte(scanner.Text()), &payload) == nil {
-				if eventType, _ := payload["type"].(string); eventType == "apple_index_complete" || eventType == "apple_index_incomplete" || eventType == "error" {
-					terminalSeen = true
-				}
-				wailsRuntime.EventsEmit(a.ctx, "apple-index-event", payload)
+	scanner := bufio.NewScanner(stdout)
+	outputBytes := 0
+	scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
+	terminalSeen := false
+	for scanner.Scan() {
+		outputBytes += len(scanner.Bytes()) + 1
+		var payload map[string]interface{}
+		if json.Unmarshal([]byte(scanner.Text()), &payload) == nil {
+			if eventType, _ := payload["type"].(string); eventType == "apple_index_complete" || eventType == "apple_index_incomplete" || eventType == "error" {
+				terminalSeen = true
 			}
+			wailsRuntime.EventsEmit(a.ctx, "apple-index-event", payload)
 		}
-		scanErr := scanner.Err()
-		waitErr := cmd.Wait()
-		a.mu.Lock()
-		wasCurrent := a.indexCmd == cmd
+	}
+	scanErr := scanner.Err()
+	waitErr := cmd.Wait()
+	close(watchDone)
+	processErr := errors.Join(scanErr, waitErr)
+	processSpan.finish(outputBytes, processErr)
+	a.mu.Lock()
+	wasCurrent := a.indexCmd == cmd
+	if wasCurrent {
+		a.indexCmd = nil
+	}
+	a.mu.Unlock()
+	if err := ctx.Err(); err != nil {
 		if wasCurrent {
-			a.indexCmd = nil
-		}
-		a.mu.Unlock()
-		if wasCurrent && !terminalSeen {
-			message := "The library index stopped before completion. It will resume from cached releases."
-			if scanErr != nil {
-				message = fmt.Sprintf("Library indexing output failed: %v", scanErr)
-			} else if waitErr != nil {
-				message = fmt.Sprintf("Library indexing stopped: %v", waitErr)
-			}
 			wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
-				"type": "apple_index_incomplete",
-				"data": map[string]interface{}{"completed": 0, "total": 1, "percent": 0, "errors": []interface{}{message}},
+				"type": "apple_index_paused", "label": "Index paused for a higher-priority operation",
 			})
 		}
-	}()
-	return nil
+		return err
+	}
+	if wasCurrent && !terminalSeen {
+		message := "The library index stopped before completion. It will resume from cached releases."
+		if scanErr != nil {
+			message = fmt.Sprintf("Library indexing output failed: %v", scanErr)
+		} else if waitErr != nil {
+			message = fmt.Sprintf("Library indexing stopped: %v", waitErr)
+		}
+		wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
+			"type": "apple_index_incomplete",
+			"data": map[string]interface{}{"completed": 0, "total": 1, "percent": 0, "errors": []interface{}{message}},
+		})
+	}
+	return processErr
 }
 
 // ResetAppleMusicIndex stops any active indexer and removes only Apple Music's
 // derived local cache. Account credentials and downloaded files are untouched.
 func (a *App) ResetAppleMusicIndex() error {
+	a.libraryIndexCoordinator().cancelKind(backgroundIndexApple)
 	a.mu.Lock()
 	indexCmd := a.indexCmd
 	a.indexCmd = nil
@@ -1306,28 +1570,14 @@ func (a *App) GetIPodDevices() string {
 	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 	defer cancel()
 
-	backend, err := ensureBundledBackend()
-	if err == nil {
-		cmd := exec.CommandContext(ctx, backend, "--ipod-devices", "--config", getConfigPath())
-		hideProcess(cmd)
-		out, runErr := cmd.Output()
-		if runErr == nil {
-			return parseLibraryOutput(out, "ipod_devices")
+	out, err := a.callReadOnlyHelper(ctx, "ipod_scan", map[string]interface{}{})
+	if err != nil {
+		if errors.Is(err, context.DeadlineExceeded) {
+			return `{"error":"iPod scan timed out"}`
 		}
+		return jsonError(err)
 	}
-	pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
-	if resolveErr != nil {
-		return `{"error":"could not resolve backend"}`
-	}
-	cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--ipod-devices", "--config", getConfigPath())
-	cmd.Dir = workDir
-	cmd.Env = env
-	hideProcess(cmd)
-	out, runErr := cmd.Output()
-	if runErr != nil {
-		return `{"error":"` + strings.ReplaceAll(runErr.Error(), `"`, `'`) + `"}`
-	}
-	return parseLibraryOutput(out, "ipod_devices")
+	return string(out)
 }
 
 // parseLibraryOutput scans newline-delimited JSON output and extracts a single
@@ -1355,46 +1605,6 @@ func parseLibraryOutput(out []byte, eventType string) string {
 	return `{"error":"no ` + eventType + ` event in backend output"}`
 }
 
-// RunAutoSync triggers an immediate auto-sync of all tracked playlists.
-// Streams newline-delimited JSON events on stdout (same format as StartDownload).
-// Returns empty string on success or an error string.
-func (a *App) RunAutoSync() string {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
-	defer cancel()
-
-	backend, err := ensureBundledBackend()
-	var cmd *exec.Cmd
-	if err != nil {
-		pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
-		if resolveErr != nil {
-			return `error:could not resolve backend`
-		}
-		cmd = exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--auto-sync", "--config", getConfigPath())
-		cmd.Dir = workDir
-		cmd.Env = env
-	} else {
-		cmd = exec.CommandContext(ctx, backend, "--auto-sync", "--config", getConfigPath())
-	}
-	hideProcess(cmd)
-
-	stdout, pipeErr := cmd.StdoutPipe()
-	if pipeErr != nil {
-		return `error:` + pipeErr.Error()
-	}
-	if startErr := cmd.Start(); startErr != nil {
-		return `error:` + startErr.Error()
-	}
-
-	scanner := bufio.NewScanner(stdout)
-	scanner.Buffer(make([]byte, 16*1024*1024), 16*1024*1024)
-	for scanner.Scan() {
-		line := scanner.Text()
-		wailsRuntime.EventsEmit(a.ctx, "auto_sync_event", line)
-	}
-	_ = cmd.Wait()
-	return ""
-}
-
 // SearchArtists searches for artists by name using the given source ("spotify" or "apple").
 // Returns a JSON string: {"type":"artist_search","data":[...]} or {"error":"..."}
 func (a *App) SearchArtists(query string, source string) string {
@@ -1405,43 +1615,17 @@ func (a *App) SearchArtists(query string, source string) string {
 		source = "spotify"
 	}
 
-	backend, err := ensureBundledBackend()
-	var out []byte
-	if err == nil {
-		cmd := exec.CommandContext(ctx, backend, "--search-artists", query, "--search-source", source, "--config", getConfigPath())
-		hideProcess(cmd)
-		out, err = cmd.Output()
-	} else {
-		// Dev fallback
-		pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
-		if resolveErr != nil {
-			return `{"error":"could not resolve backend"}`
-		}
-		cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--search-artists", query, "--search-source", source, "--config", getConfigPath())
-		cmd.Dir = workDir
-		cmd.Env = env
-		hideProcess(cmd)
-		out, err = cmd.Output()
-	}
-
+	out, err := a.callReadOnlyHelper(ctx, "artist_search", map[string]interface{}{
+		"query":  query,
+		"source": source,
+	})
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(err, context.DeadlineExceeded) {
 			return `{"error":"artist search timed out"}`
 		}
-		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+		return jsonError(err)
 	}
-
-	// Unwrap {"type":"artist_search","data":[...]} → just the data array as JSON string
-	var wrapper map[string]interface{}
-	if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &wrapper); jsonErr != nil {
-		return string(out)
-	}
-	if wrapper["type"] == "error" {
-		msg, _ := wrapper["message"].(string)
-		return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
-	}
-	result, _ := json.Marshal(wrapper["data"])
-	return string(result)
+	return string(out)
 }
 
 func (a *App) GetDiscoveryData(region string, genreId string, genreName string) string {
@@ -1452,56 +1636,18 @@ func (a *App) GetDiscoveryData(region string, genreId string, genreName string) 
 		region = "us"
 	}
 
-	backend, err := ensureBundledBackend()
-	var out []byte
-	if err == nil {
-		args := []string{"--discovery-json", "--discovery-region", region}
-		if genreId != "" {
-			args = append(args, "--discovery-genre-id", genreId)
-		}
-		if genreName != "" {
-			args = append(args, "--discovery-genre-name", genreName)
-		}
-		args = append(args, "--config", getConfigPath())
-		cmd := exec.CommandContext(ctx, backend, args...)
-		hideProcess(cmd)
-		out, err = cmd.Output()
-	} else {
-		pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
-		if resolveErr != nil {
-			return `{"error":"could not resolve backend"}`
-		}
-		args := []string{"-m", "antra.json_cli", "--discovery-json", "--discovery-region", region}
-		if genreId != "" {
-			args = append(args, "--discovery-genre-id", genreId)
-		}
-		if genreName != "" {
-			args = append(args, "--discovery-genre-name", genreName)
-		}
-		args = append(args, "--config", getConfigPath())
-		cmd := exec.CommandContext(ctx, pythonExe, args...)
-		cmd.Dir = workDir
-		cmd.Env = env
-		hideProcess(cmd)
-		out, err = cmd.Output()
-	}
-
+	out, err := a.callReadOnlyHelper(ctx, "discovery", map[string]interface{}{
+		"region":     region,
+		"genre_id":   genreId,
+		"genre_name": genreName,
+	})
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(err, context.DeadlineExceeded) {
 			return `{"error":"discovery fetch timed out"}`
 		}
-		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+		return jsonError(err)
 	}
-
-	var wrapper map[string]interface{}
-	if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &wrapper); jsonErr != nil {
-		return string(out)
-	}
-	if wrapper["type"] == "error" {
-		msg, _ := wrapper["message"].(string)
-		return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
-	}
-	return string(bytes.TrimSpace(out))
+	return string(out)
 }
 
 func (a *App) GetDiscoveryGenres(region string) string {
@@ -1512,40 +1658,16 @@ func (a *App) GetDiscoveryGenres(region string) string {
 		region = "us"
 	}
 
-	backend, err := ensureBundledBackend()
-	var out []byte
-	if err == nil {
-		cmd := exec.CommandContext(ctx, backend, "--discovery-genres-only", "--discovery-region", region, "--config", getConfigPath())
-		hideProcess(cmd)
-		out, err = cmd.Output()
-	} else {
-		pythonExe, _, workDir, env, resolveErr := a.resolveBackendCommand([]string{})
-		if resolveErr != nil {
-			return `{"error":"could not resolve backend"}`
-		}
-		cmd := exec.CommandContext(ctx, pythonExe, "-m", "antra.json_cli", "--discovery-genres-only", "--discovery-region", region, "--config", getConfigPath())
-		cmd.Dir = workDir
-		cmd.Env = env
-		hideProcess(cmd)
-		out, err = cmd.Output()
-	}
-
+	out, err := a.callReadOnlyHelper(ctx, "discovery_genres", map[string]interface{}{
+		"region": region,
+	})
 	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
+		if errors.Is(err, context.DeadlineExceeded) {
 			return `{"error":"genres fetch timed out"}`
 		}
-		return `{"error":"` + strings.ReplaceAll(err.Error(), `"`, `'`) + `"}`
+		return jsonError(err)
 	}
-
-	var wrapper map[string]interface{}
-	if jsonErr := json.Unmarshal(bytes.TrimSpace(out), &wrapper); jsonErr != nil {
-		return string(out)
-	}
-	if wrapper["type"] == "error" {
-		msg, _ := wrapper["message"].(string)
-		return `{"error":"` + strings.ReplaceAll(msg, `"`, `'`) + `"}`
-	}
-	return string(bytes.TrimSpace(out))
+	return string(out)
 }
 
 func (a *App) GetSpotifyStatus() string {
@@ -1595,7 +1717,12 @@ func (a *App) resolveBackendCommand(playlists []string) (string, []string, strin
 	if workers < 1 {
 		workers = 2
 	}
-	extraEnv := []string{"PYTHONUTF8=1", fmt.Sprintf("ANTRA_MAX_WORKERS=%d", workers), "ANTRA_CONTROL_PATH=" + getDownloadControlPath()}
+	extraEnv := []string{
+		"PYTHONUTF8=1",
+		fmt.Sprintf("ANTRA_MAX_WORKERS=%d", workers),
+		fmt.Sprintf("ANTRA_WORKER_CEILING=%d", downloadWorkerCeiling()),
+		"ANTRA_CONTROL_PATH=" + getDownloadControlPath(),
+	}
 
 	if bundledBackend, err := ensureBundledBackend(); err == nil {
 		args := append([]string{}, playlists...)

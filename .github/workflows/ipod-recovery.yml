@@ -1,0 +1,81 @@
+name: iPod recovery safety gates
+
+on:
+  pull_request:
+    paths:
+      - "antra/core/ipod_*.py"
+      - "antra-wails/ipod_*.go"
+      - "antra-wails/frontend/src/lib/ipod/**"
+      - "antra-wails/frontend/src/lib/IPodManager.svelte"
+      - "antra-wails/frontend/src/lib/ipodTypes.ts"
+      - "packaging/ipod-unlock/**"
+      - "tests/test_ipod_*.py"
+      - ".github/workflows/ipod-recovery.yml"
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "antra/core/ipod_*.py"
+      - "antra-wails/ipod_*.go"
+      - "antra-wails/frontend/src/lib/ipod/**"
+      - "antra-wails/frontend/src/lib/IPodManager.svelte"
+      - "antra-wails/frontend/src/lib/ipodTypes.ts"
+      - "packaging/ipod-unlock/**"
+      - "tests/test_ipod_*.py"
+      - ".github/workflows/ipod-recovery.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-safety:
+    name: Windows recovery and USB safety
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: antra-wails/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+          cache-dependency-path: antra-wails/frontend/package-lock.json
+
+      - name: Install test tools
+        run: python -m pip install "pytest>=8.3,<10"
+
+      - name: Verify pinned source and licensing inputs
+        run: python packaging/ipod-unlock/verify_release_inputs.py
+
+      - name: Run iPod Python tests
+        run: >-
+          python -m pytest -q
+          tests/test_ipod_service.py
+          tests/test_ipod_operation_journal.py
+          tests/test_ipod_migration.py
+          tests/test_ipod_syscfg.py
+          tests/test_ipod_capacity_unlock.py
+          tests/test_ipod_capacity_unlock_service.py
+          tests/test_ipod_unlock_artifacts.py
+              tests/test_ipod_windows_raw.py
+
+      - name: Run Windows Go tests
+        working-directory: antra-wails
+        run: go test ./...
+
+      - name: Check and build Svelte frontend
+        working-directory: antra-wails/frontend
+        run: |
+          npm ci
+          npm run check
+          npm run build

@@ -11,8 +11,10 @@ Vela is a desktop application for browsing an Apple Music library and building a
 - Downloads are grouped into resumable jobs with configurable concurrency, pause, cancel, progress, and history controls.
 - Output supports FLAC, ALAC, AAC, and MP3, using the retained non-P2P downloader sources.
 - All product features are available in the paid build; there is no supporter key or feature-gated tier.
+- iPod management now includes offline backup inventory/verification/export, journaled same-device full file restore, reviewed compatible replacement-device migration, and durable interrupted-operation recovery. Windows also reports attached Mac-formatted HFS+ iPods through bounded raw read-only metadata inspection instead of silently omitting them; filesystem-dependent actions remain blocked until a trusted HFS+ layer is available. The Advanced Windows Classic 6G/6.5G capacity unlock remains Experimental and requires manual Rockbox, NOR, DFU, and iTunes steps plus supervised hardware validation.
+- Appearance and general preferences have a versioned configuration schema with bounded scale, density, sidebar/artwork sizing, motion, player volume, startup, notification, and history-retention settings. The corresponding Settings/player UI is completed separately in the desktop frontend.
 
-See [FEATURES.md](FEATURES.md) for the detailed feature inventory, [PRD.md](PRD.md) for product requirements, [design-system.md](design-system.md) for the interface specification, and [the desktop release contract](docs/desktop-builds.md).
+See [FEATURES.md](FEATURES.md) for the detailed feature inventory, [PRD.md](PRD.md) for product requirements, [design-system.md](design-system.md) for the interface specification, [the desktop release contract](docs/desktop-builds.md), [docs/ipod-backend.md](docs/ipod-backend.md) for the device safety/API contract, [the still-unrun macOS iPod qualification](docs/macos-ipod-qualification.md), and [the capacity-unlock hardware matrix](docs/ipod-capacity-unlock-hardware-matrix.md) for the still-blocked experimental release gate.
 
 ## Test the UI
 

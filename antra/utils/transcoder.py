@@ -6,6 +6,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from typing import Callable
 
 from mutagen import File as MutagenFile
 
@@ -13,6 +14,8 @@ from mutagen import File as MutagenFile
 _SUBPROCESS_FLAGS = {}
 if sys.platform == "win32":
     _SUBPROCESS_FLAGS["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+_PROBE_UNSET = object()
 
 
 OUTPUT_FORMAT_EXTENSION = {
@@ -39,6 +42,9 @@ class ConversionPlan:
 
 class AudioTranscoder:
     _LOSSY_EXTENSIONS = {".mp3", ".aac"}
+
+    def __init__(self, probe_lookup: Callable[[str], object] | None = None):
+        self._probe_lookup = probe_lookup
 
     def _is_lossy(self, file_path: str) -> bool:
         return os.path.splitext(file_path)[1].lower() in self._LOSSY_EXTENSIONS
@@ -96,7 +102,18 @@ class AudioTranscoder:
         if not ffmpeg:
             raise RuntimeError("ffmpeg is required for output format conversion")
 
-        plan = self._plan(target_format, file_path=file_path)
+        base_format = (
+            target_format.split("-")[0]
+            if target_format.endswith(("-16", "-24"))
+            else target_format
+        )
+        source_codec: object = _PROBE_UNSET
+        if (
+            base_format in {"aac", "m4a"}
+            and os.path.splitext(file_path)[1].lower() in {".m4a", ".mp4"}
+        ):
+            source_codec = self._probe_codec_name(file_path)
+        plan = self._plan(target_format, file_path=file_path, source_codec=source_codec)
         base, _ = os.path.splitext(file_path)
         temp_output = base + f".antra-convert{plan.extension}"
         final_output = base + plan.extension
@@ -138,7 +155,11 @@ class AudioTranscoder:
         return final_output
 
     @staticmethod
-    def _plan(target_format: str, file_path: str = "") -> ConversionPlan:
+    def _plan(
+        target_format: str,
+        file_path: str = "",
+        source_codec: object = _PROBE_UNSET,
+    ) -> ConversionPlan:
         # Normalise bit-depth variants to base format
         base_format = target_format.split("-")[0] if target_format.endswith(("-16", "-24")) else target_format
         # For a "-16" request, force 16-bit output (ffmpeg dithers on bit-depth
@@ -164,7 +185,7 @@ class AudioTranscoder:
                 codec_args=["-c:a", "alac", *depth_args],
             )
         if base_format == "aac":
-            if AudioTranscoder._can_normalize_aac_container(file_path):
+            if AudioTranscoder._can_normalize_aac_container(file_path, source_codec):
                 return ConversionPlan(
                     target_format=base_format,
                     extension=".m4a",
@@ -176,7 +197,7 @@ class AudioTranscoder:
                 codec_args=["-c:a", "aac", "-b:a", "320k", "-f", "ipod", "-movflags", "+faststart"],
             )
         if base_format == "m4a":
-            if AudioTranscoder._can_normalize_aac_container(file_path):
+            if AudioTranscoder._can_normalize_aac_container(file_path, source_codec):
                 return ConversionPlan(
                     target_format=base_format,
                     extension=".m4a",
@@ -190,19 +211,34 @@ class AudioTranscoder:
         raise ValueError(f"Unsupported output format: {target_format}")
 
     @staticmethod
-    def _can_normalize_aac_container(file_path: str) -> bool:
+    def _can_normalize_aac_container(
+        file_path: str,
+        source_codec: object = _PROBE_UNSET,
+    ) -> bool:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".aac":
             return True
         if ext not in {".m4a", ".mp4"}:
             return False
-        codec = AudioTranscoder._probe_codec_name(file_path)
+        codec = (
+            AudioTranscoder._probe_codec_name_uncached(file_path)
+            if source_codec is _PROBE_UNSET
+            else str(source_codec or "").lower()
+        )
         if not codec:
             return True
         return "alac" not in codec
 
+    def _probe_codec_name(self, file_path: str) -> str:
+        if self._probe_lookup is not None:
+            try:
+                return str(getattr(self._probe_lookup(file_path), "codec", "") or "").lower()
+            except Exception:
+                return ""
+        return self._probe_codec_name_uncached(file_path)
+
     @staticmethod
-    def _probe_codec_name(file_path: str) -> str:
+    def _probe_codec_name_uncached(file_path: str) -> str:
         try:
             audio = MutagenFile(file_path)
         except Exception:
@@ -211,10 +247,17 @@ class AudioTranscoder:
         codec = getattr(info, "codec", "") if info else ""
         return str(codec or "").lower()
 
-    @staticmethod
-    def _source_bit_depth(file_path: str) -> int | None:
+    def _source_bit_depth(self, file_path: str) -> int | None:
         """Bits-per-sample of a lossless source (FLAC/ALAC), or None if unknown.
         Used to decide whether a 16-bit request needs a downsample pass."""
+        if self._probe_lookup is not None:
+            try:
+                depth = getattr(self._probe_lookup(file_path), "bit_depth", None)
+                return int(depth) if depth else None
+            except (TypeError, ValueError):
+                return None
+            except Exception:
+                return None
         try:
             audio = MutagenFile(file_path)
         except Exception:

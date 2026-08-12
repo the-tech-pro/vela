@@ -47,7 +47,13 @@ class TidalMirrorAdapter(BaseSourceAdapter):
     name = "tidal_mirror"
     priority = 1  # Highest — 24-bit HiRes FLAC
 
-    def __init__(self, mirror_url: str, api_key: str = "", preferred_output_format: str = "source"):
+    def __init__(
+        self,
+        mirror_url: str,
+        api_key: str = "",
+        preferred_output_format: str = "source",
+        odesli_enricher: Optional[OdesliEnricher] = None,
+    ):
         self._base = mirror_url.rstrip("/")
         self._session = requests.Session()
         self._session.headers.update({
@@ -60,7 +66,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         self._available: Optional[bool] = None  # cached health check result
         self._album_id_cache: dict[str, str] = {}
         self._album_track_cache: dict[str, list[dict]] = {}
-        self._odesli = OdesliEnricher()
+        self._odesli = odesli_enricher or OdesliEnricher()
 
     def _requires_strict_24bit(self) -> bool:
         if getattr(_quality_fallback_tls, "current_fallback", False):
@@ -516,6 +522,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                         if chunk:
                             total_bytes += len(chunk)
                             f.write(chunk)
+                            self.report_download_progress(total_bytes, content_length or None)
                 # Verify downloaded bytes are reasonable for the track duration.
                 # This catches server-relay truncation where the CDN drops mid-stream.
                 if content_length > 0 and total_bytes < content_length * 0.90:
@@ -620,10 +627,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
         # expire in ~5 min but the download itself can take time on slow connections.
         with self._session.get(url, stream=True, timeout=(15, 60)) as r:
             r.raise_for_status()
-            with open(final_path, "wb") as f:
-                for chunk in r.iter_content(131072):  # 128KB chunks
-                    if chunk:
-                        f.write(chunk)
+            self.write_stream_to_file(r, final_path, 131072)
         # Remux M4A→FLAC if needed (Tidal wraps FLAC in M4A container)
         if ext == ".m4a":
             flac_path = output_base + ".flac"
@@ -643,10 +647,7 @@ class TidalMirrorAdapter(BaseSourceAdapter):
                 # No read timeout — segments can be large, connect timeout 15s
                 with self._session.get(url, stream=True, timeout=(15, 60)) as r:
                     r.raise_for_status()
-                    with open(seg, "wb") as f:
-                        for chunk in r.iter_content(131072):
-                            if chunk:
-                                f.write(chunk)
+                    self.write_stream_to_file(r, seg, 131072)
                 segs.append(seg)
             final_path = output_base + ext
             os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)

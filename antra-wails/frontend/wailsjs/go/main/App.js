@@ -6,8 +6,28 @@ export function AddHistory(arg1) {
   return window['go']['main']['App']['AddHistory'](arg1);
 }
 
+export function AdvanceIPodCapacityUnlock(arg1) {
+  return window['go']['main']['App']['AdvanceIPodCapacityUnlock'](arg1);
+}
+
+export function BrowseIPodLibrary(arg1) {
+  return window['go']['main']['App']['BrowseIPodLibrary'](arg1);
+}
+
+export function CancelAutoSync() {
+  return window['go']['main']['App']['CancelAutoSync']();
+}
+
 export function CancelDownload() {
   return window['go']['main']['App']['CancelDownload']();
+}
+
+export function CancelIPodOperation() {
+  return window['go']['main']['App']['CancelIPodOperation']();
+}
+
+export function CancelIPodOperationByID(arg1) {
+  return window['go']['main']['App']['CancelIPodOperationByID'](arg1);
 }
 
 export function CaptureSpDC() {
@@ -24,6 +44,34 @@ export function ClearHistory() {
 
 export function ConfirmAmazonLogin() {
   return window['go']['main']['App']['ConfirmAmazonLogin']();
+}
+
+export function CreateIPodBackup(arg1) {
+  return window['go']['main']['App']['CreateIPodBackup'](arg1);
+}
+
+export function CreateIPodSyncPlan(arg1) {
+  return window['go']['main']['App']['CreateIPodSyncPlan'](arg1);
+}
+
+export function CreateManualIPodBackup(arg1) {
+  return window['go']['main']['App']['CreateManualIPodBackup'](arg1);
+}
+
+export function DeleteIPodBackup(arg1) {
+  return window['go']['main']['App']['DeleteIPodBackup'](arg1);
+}
+
+export function EjectIPod(arg1) {
+  return window['go']['main']['App']['EjectIPod'](arg1);
+}
+
+export function ExecuteIPodSync(arg1) {
+  return window['go']['main']['App']['ExecuteIPodSync'](arg1);
+}
+
+export function ExportIPodBackup(arg1) {
+  return window['go']['main']['App']['ExportIPodBackup'](arg1);
 }
 
 export function GetAppleMusicArtistDetail(arg1) {
@@ -54,6 +102,10 @@ export function GetDiscoveryGenres(arg1) {
   return window['go']['main']['App']['GetDiscoveryGenres'](arg1);
 }
 
+export function GetDownloadWorkerCapacity() {
+  return window['go']['main']['App']['GetDownloadWorkerCapacity']();
+}
+
 export function GetDownloadedMusicLibrary() {
   return window['go']['main']['App']['GetDownloadedMusicLibrary']();
 }
@@ -66,8 +118,24 @@ export function GetHistory() {
   return window['go']['main']['App']['GetHistory']();
 }
 
+export function GetIPodBackupSnapshot(arg1) {
+  return window['go']['main']['App']['GetIPodBackupSnapshot'](arg1);
+}
+
+export function GetIPodCapacityUnlockEligibility(arg1) {
+  return window['go']['main']['App']['GetIPodCapacityUnlockEligibility'](arg1);
+}
+
 export function GetIPodDevices() {
   return window['go']['main']['App']['GetIPodDevices']();
+}
+
+export function GetIPodRecoveryState() {
+  return window['go']['main']['App']['GetIPodRecoveryState']();
+}
+
+export function GetIPodSyncPlanDetails(arg1) {
+  return window['go']['main']['App']['GetIPodSyncPlanDetails'](arg1);
 }
 
 export function GetSpotifyStatus() {
@@ -78,8 +146,24 @@ export function GetSuggestedDownloadLocation(arg1) {
   return window['go']['main']['App']['GetSuggestedDownloadLocation'](arg1);
 }
 
+export function GetThirdPartyNotices() {
+  return window['go']['main']['App']['GetThirdPartyNotices']();
+}
+
 export function GetTrackLyrics(arg1) {
   return window['go']['main']['App']['GetTrackLyrics'](arg1);
+}
+
+export function InspectIPodRecoveryUSB() {
+  return window['go']['main']['App']['InspectIPodRecoveryUSB']();
+}
+
+export function ListIPodBackupDevices() {
+  return window['go']['main']['App']['ListIPodBackupDevices']();
+}
+
+export function ListIPodBackupSnapshots(arg1) {
+  return window['go']['main']['App']['ListIPodBackupSnapshots'](arg1);
 }
 
 export function LoginSpotify() {
@@ -98,6 +182,18 @@ export function PickDirectory() {
   return window['go']['main']['App']['PickDirectory']();
 }
 
+export function PickIPodRecoveryFile() {
+  return window['go']['main']['App']['PickIPodRecoveryFile']();
+}
+
+export function PreflightIPodMigration(arg1) {
+  return window['go']['main']['App']['PreflightIPodMigration'](arg1);
+}
+
+export function PreflightIPodRestore(arg1) {
+  return window['go']['main']['App']['PreflightIPodRestore'](arg1);
+}
+
 export function RefreshAppleMusicLibrary() {
   return window['go']['main']['App']['RefreshAppleMusicLibrary']();
 }
@@ -114,10 +210,6 @@ export function ResumeDownload() {
   return window['go']['main']['App']['ResumeDownload']();
 }
 
-export function RetryTrackDownload(arg1) {
-  return window['go']['main']['App']['RetryTrackDownload'](arg1);
-}
-
 export function RunAutoSync() {
   return window['go']['main']['App']['RunAutoSync']();
 }
@@ -128,6 +220,10 @@ export function SaveConfig(arg1) {
 
 export function SaveCoverArt(arg1, arg2) {
   return window['go']['main']['App']['SaveCoverArt'](arg1, arg2);
+}
+
+export function ScanIPodDevices() {
+  return window['go']['main']['App']['ScanIPodDevices']();
 }
 
 export function SearchArtists(arg1, arg2) {
@@ -146,6 +242,10 @@ export function SetSpotifyToken(arg1) {
   return window['go']['main']['App']['SetSpotifyToken'](arg1);
 }
 
+export function StageDownloadsForIPod(arg1) {
+  return window['go']['main']['App']['StageDownloadsForIPod'](arg1);
+}
+
 export function StartAmazonBrowserLogin() {
   return window['go']['main']['App']['StartAmazonBrowserLogin']();
 }
@@ -162,10 +262,38 @@ export function StartDownload(arg1) {
   return window['go']['main']['App']['StartDownload'](arg1);
 }
 
+export function StartIPodCapacityUnlock(arg1) {
+  return window['go']['main']['App']['StartIPodCapacityUnlock'](arg1);
+}
+
+export function StartIPodMigration(arg1) {
+  return window['go']['main']['App']['StartIPodMigration'](arg1);
+}
+
+export function StartIPodRestore(arg1) {
+  return window['go']['main']['App']['StartIPodRestore'](arg1);
+}
+
+export function StartIPodWatcher() {
+  return window['go']['main']['App']['StartIPodWatcher']();
+}
+
 export function StartTidalOAuthLogin() {
   return window['go']['main']['App']['StartTidalOAuthLogin']();
 }
 
+export function StopIPodWatcher() {
+  return window['go']['main']['App']['StopIPodWatcher']();
+}
+
+export function UpdateIPodBackupNote(arg1) {
+  return window['go']['main']['App']['UpdateIPodBackupNote'](arg1);
+}
+
 export function ValidateTidalAuth() {
   return window['go']['main']['App']['ValidateTidalAuth']();
+}
+
+export function VerifyIPodBackup(arg1) {
+  return window['go']['main']['App']['VerifyIPodBackup'](arg1);
 }

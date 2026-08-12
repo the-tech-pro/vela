@@ -267,6 +267,17 @@ class AntraService:
         """Build the active download chain for the app."""
         adapters: list = []
         enabled_sources = _parse_enabled_sources(getattr(cfg, "sources_enabled", ""))
+        shared_odesli_enricher = None
+
+        def get_shared_odesli_enricher():
+            nonlocal shared_odesli_enricher
+            if shared_odesli_enricher is None:
+                from antra.sources.odesli import OdesliEnricher
+
+                shared_odesli_enricher = OdesliEnricher(
+                    api_key=getattr(cfg, "odesli_api_key", "") or None,
+                )
+            return shared_odesli_enricher
 
         def source_group_enabled(name: str) -> bool:
             if not enabled_sources or name in enabled_sources:
@@ -326,6 +337,7 @@ class AntraService:
                     mirror_url=tidal_mirror_url,
                     api_key=mirror_api_key,
                     preferred_output_format=cfg.output_format,
+                    odesli_enricher=get_shared_odesli_enricher(),
                 )
                 if adapter.is_available():
                     adapters.append(adapter)
@@ -392,6 +404,7 @@ class AntraService:
                     refresh_token=getattr(cfg, "tidal_refresh_token", ""),
                     session_id=getattr(cfg, "tidal_session_id", ""),
                     token_type=getattr(cfg, "tidal_token_type", "Bearer"),
+                    odesli_enricher=get_shared_odesli_enricher(),
                 )
                 if adapter.is_available():
                     adapters.append(adapter)
@@ -480,6 +493,7 @@ class AntraService:
                     music_user_token=getattr(cfg, "apple_music_user_token", ""),
                     storefront=getattr(cfg, "apple_storefront", "gb"),
                     wvd_path=getattr(cfg, "apple_wvd_path", ""),
+                    odesli_enricher=get_shared_odesli_enricher(),
                 )
                 if adapter.is_available():
                     adapters.append(adapter)
@@ -524,6 +538,7 @@ class AntraService:
                     direct_creds_json=amazon_direct_creds_json,
                     mirror_api_key=mirror_api_key,
                     preferred_output_format=cfg.output_format,
+                    odesli_enricher=get_shared_odesli_enricher(),
                 )
                 if adapter.is_available():
                     adapters.append(adapter)
@@ -1234,7 +1249,7 @@ class AntraService:
                 "Connect Apple Music in Settings first."
             )
 
-        client = AppleLibraryClient(
+        with AppleLibraryClient(
             authorization_token=authorization,
             music_user_token=music_user_token,
             storefront=storefront,
@@ -1242,18 +1257,18 @@ class AntraService:
                 os.path.join(os.path.dirname(os.path.abspath(os.environ["ANTRA_CONFIG_PATH"])), "apple_library_cache.sqlite3")
                 if os.environ.get("ANTRA_CONFIG_PATH") else None
             ),
-        )
-        if url == APPLE_LIBRARY_SONGS_URL:
-            return client.get_saved_songs_tracks(page_callback=page_callback)
+        ) as client:
+            if url == APPLE_LIBRARY_SONGS_URL:
+                return client.get_saved_songs_tracks(page_callback=page_callback)
 
-        album_id = extract_apple_library_album_id(url)
-        if album_id:
-            return client.get_library_album_tracks(album_id, page_callback=page_callback)
+            album_id = extract_apple_library_album_id(url)
+            if album_id:
+                return client.get_library_album_tracks(album_id, page_callback=page_callback)
 
-        playlist_id = extract_apple_library_playlist_id(url)
-        if not playlist_id:
-            raise ValueError(f"Unsupported Apple Music library URL: {url}")
-        return client.get_library_playlist_tracks(playlist_id, page_callback=page_callback)
+            playlist_id = extract_apple_library_playlist_id(url)
+            if not playlist_id:
+                raise ValueError(f"Unsupported Apple Music library URL: {url}")
+            return client.get_library_playlist_tracks(playlist_id, page_callback=page_callback)
 
     def _fetch_soundcloud_tracks(self, url: str, cfg: Config) -> list[TrackMetadata]:
         try:

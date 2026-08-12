@@ -3,9 +3,13 @@ File tagger using mutagen.
 Supports MP3 (ID3) and FLAC (VorbisComment).
 Embeds: title, artists, album, year, track number, genre, artwork, lyrics.
 """
+import hashlib
 import logging
 import os
 import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from io import BytesIO
 from typing import Optional
 
@@ -42,6 +46,14 @@ from antra.core.models import TrackMetadata
 
 logger = logging.getLogger(__name__)
 
+_Artwork = tuple[bytes, str, int, int, int]
+
+
+@dataclass
+class _ArtworkFlight:
+    event: threading.Event = field(default_factory=threading.Event)
+    result: Optional[_Artwork] = None
+
 
 def _sniff_image_mime(data: bytes, response_mime: Optional[str]) -> str:
     mime = (response_mime or "").split(";")[0].strip().lower()
@@ -58,12 +70,15 @@ def _sniff_image_mime(data: bytes, response_mime: Optional[str]) -> str:
 
 class FileTagger:
     _MAX_EMBEDDED_ART_EDGE = 1000
+    _DEFAULT_ARTWORK_CACHE_ENTRIES = 64
 
-    def __init__(self):
-        # Cache artwork by URL so albums only hit the CDN once regardless of
-        # how many tracks share the same artwork_url.
-        self._artwork_cache: dict[str, Optional[tuple[bytes, str, int, int, int]]] = {}
-        self._raw_artwork_cache: dict[str, Optional[tuple[bytes, str]]] = {}
+    def __init__(self, artwork_cache_entries: int = _DEFAULT_ARTWORK_CACHE_ENTRIES):
+        self._artwork_cache_entries = max(1, int(artwork_cache_entries))
+        self._artwork_cache: OrderedDict[str, Optional[_Artwork]] = OrderedDict()
+        self._artwork_content_cache: OrderedDict[tuple[str, str], Optional[_Artwork]] = OrderedDict()
+        self._artwork_flights: dict[str, _ArtworkFlight] = {}
+        self._artwork_content_flights: dict[tuple[str, str], _ArtworkFlight] = {}
+        self._artwork_lock = threading.Lock()
         self._sidecar_lock = threading.Lock()
 
     def tag(
@@ -117,11 +132,15 @@ class FileTagger:
             if existing:
                 return existing
 
-            artwork = self._fetch_raw_artwork(track.artwork_url)
-            if not artwork:
-                return None
+        artwork = self._fetch_raw_artwork(track.artwork_url)
+        if not artwork:
+            return None
 
-            data, mime = artwork
+        data, mime = artwork
+        with self._sidecar_lock:
+            existing = self._existing_cover_sidecar(folder)
+            if existing:
+                return existing
             ext = ".png" if mime == "image/png" else ".jpg"
             out_path = os.path.join(folder, f"cover{ext}")
             try:
@@ -291,28 +310,93 @@ class FileTagger:
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
-    def _fetch_artwork(self, url: Optional[str]) -> Optional[tuple[bytes, str, int, int, int]]:
+    def _fetch_artwork(self, url: Optional[str]) -> Optional[_Artwork]:
         if not url:
             return None
-        if url in self._artwork_cache:
-            return self._artwork_cache[url]
+        with self._artwork_lock:
+            if url in self._artwork_cache:
+                result = self._artwork_cache.pop(url)
+                self._artwork_cache[url] = result
+                return result
+            flight = self._artwork_flights.get(url)
+            if flight is None:
+                flight = _ArtworkFlight()
+                self._artwork_flights[url] = flight
+                owner = True
+            else:
+                owner = False
 
-        result = None
-        for attempt in range(3):
-            try:
-                resp = requests.get(url, timeout=10)
-                resp.raise_for_status()
-                result = FileTagger._normalize_artwork(resp.content, resp.headers.get("Content-Type"))
-                break
-            except Exception as e:
-                if attempt < 2:
-                    import time
-                    time.sleep(1.5 ** attempt)
-                else:
-                    logger.warning(f"Failed to download artwork from {url}: {e}")
+        if not owner:
+            flight.event.wait()
+            return flight.result
 
-        self._artwork_cache[url] = result
+        result: Optional[_Artwork] = None
+        try:
+            for attempt in range(3):
+                try:
+                    resp = requests.get(url, timeout=10)
+                    resp.raise_for_status()
+                    result = self._prepare_artwork_content_once(
+                        bytes(resp.content),
+                        resp.headers.get("Content-Type"),
+                    )
+                    if result is None:
+                        raise ValueError("artwork could not be decoded")
+                    break
+                except Exception as exc:
+                    if attempt < 2:
+                        time.sleep(1.5 ** attempt)
+                    else:
+                        logger.warning("Failed to download artwork from %s: %s", url, exc)
+        finally:
+            with self._artwork_lock:
+                self._remember_artwork(self._artwork_cache, url, result)
+                self._artwork_flights.pop(url, None)
+                flight.result = result
+                flight.event.set()
         return result
+
+    def _prepare_artwork_content_once(
+        self,
+        data: bytes,
+        response_mime: Optional[str],
+    ) -> Optional[_Artwork]:
+        content_key = (hashlib.sha256(data).hexdigest(), _sniff_image_mime(data, response_mime))
+        with self._artwork_lock:
+            if content_key in self._artwork_content_cache:
+                result = self._artwork_content_cache.pop(content_key)
+                self._artwork_content_cache[content_key] = result
+                return result
+            flight = self._artwork_content_flights.get(content_key)
+            if flight is None:
+                flight = _ArtworkFlight()
+                self._artwork_content_flights[content_key] = flight
+                owner = True
+            else:
+                owner = False
+
+        if not owner:
+            flight.event.wait()
+            return flight.result
+
+        result: Optional[_Artwork] = None
+        try:
+            result = self._normalize_artwork(data, response_mime)
+        except Exception as exc:
+            logger.debug("Failed to decode artwork content: %s", exc)
+        finally:
+            with self._artwork_lock:
+                self._remember_artwork(self._artwork_content_cache, content_key, result)
+                self._artwork_content_flights.pop(content_key, None)
+                flight.result = result
+                flight.event.set()
+        return result
+
+    def _remember_artwork(self, cache: OrderedDict, key, value) -> None:
+        cache[key] = value
+        cache.move_to_end(key)
+        while len(cache) > self._artwork_cache_entries:
+            cache.popitem(last=False)
 
     @staticmethod
     def _existing_cover_sidecar(folder: str) -> Optional[str]:
@@ -323,27 +407,11 @@ class FileTagger:
         return None
 
     def _fetch_raw_artwork(self, url: Optional[str]) -> Optional[tuple[bytes, str]]:
-        if not url:
+        artwork = self._fetch_artwork(url)
+        if not artwork:
             return None
-        if url in self._raw_artwork_cache:
-            return self._raw_artwork_cache[url]
-
-        result: Optional[tuple[bytes, str]] = None
-        for attempt in range(3):
-            try:
-                resp = requests.get(url, timeout=10)
-                resp.raise_for_status()
-                result = FileTagger._prepare_sidecar_artwork(resp.content, resp.headers.get("Content-Type"))
-                break
-            except Exception as e:
-                if attempt < 2:
-                    import time
-                    time.sleep(1.5 ** attempt)
-                else:
-                    logger.warning(f"Failed to download sidecar artwork from {url}: {e}")
-
-        self._raw_artwork_cache[url] = result
-        return result
+        data, mime, _width, _height, _depth = artwork
+        return data, mime
 
     @staticmethod
     def _prepare_sidecar_artwork(data: bytes, response_mime: Optional[str]) -> tuple[bytes, str]:

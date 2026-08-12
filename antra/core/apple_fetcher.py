@@ -474,8 +474,8 @@ class AppleFetcher:
                     artwork = attrs.get("artwork", {})
                     artwork_url: Optional[str] = None
                     if artwork:
-                        w = artwork.get("width") or 3000
-                        h = artwork.get("height") or 3000
+                        w = min(int(artwork.get("width") or 600), 600)
+                        h = min(int(artwork.get("height") or 600), 600)
                         url_tpl = artwork.get("url", "")
                         if url_tpl:
                             artwork_url = url_tpl.replace("{w}", str(w)).replace("{h}", str(h))
@@ -732,8 +732,8 @@ class AppleFetcher:
             if art_raw:
                 artwork_url = (
                     art_raw.get("url", "")
-                    .replace("{w}", "3000")
-                    .replace("{h}", "3000")
+                    .replace("{w}", "1200")
+                    .replace("{h}", "1200")
                 )
                 
             genres = attrs.get("genreNames", [])

@@ -510,6 +510,7 @@ class AppleAdapter(BaseSourceAdapter):
     """
 
     name = "apple"
+    max_concurrent_searches = 2
     # always_lossy is set dynamically in __init__ based on whether the mirror
     # has wrapper (lossless) available.  Default True = skip in lossless mode
     # until we confirm the mirror can serve ALAC.
@@ -525,6 +526,7 @@ class AppleAdapter(BaseSourceAdapter):
         music_user_token: str = "",
         storefront: str = "us",
         wvd_path: str = "",
+        odesli_enricher: Optional[OdesliEnricher] = None,
     ):
         self._session = requests.Session()
         self._session.trust_env = False
@@ -540,7 +542,7 @@ class AppleAdapter(BaseSourceAdapter):
         }
         if mirror_api_key:
             self._session.headers["X-API-Key"] = mirror_api_key
-        self._odesli = OdesliEnricher(api_key=api_key)
+        self._odesli = odesli_enricher or OdesliEnricher(api_key=api_key)
         self._apple_fetcher = AppleFetcher()
         self.priority = 0 if self._preferred_output_format in {"alac", "alac-16", "alac-24"} else 2
 
@@ -962,10 +964,7 @@ class AppleAdapter(BaseSourceAdapter):
                 if resp.status_code == 200:
                     final_path = output_path + ".m4a"
                     os.makedirs(os.path.dirname(os.path.abspath(final_path)), exist_ok=True)
-                    with open(final_path, "wb") as f:
-                        for chunk in resp.iter_content(131072):
-                            if chunk:
-                                f.write(chunk)
+                    self.write_stream_to_file(resp, final_path, 131072)
 
                     # Update result metadata from response headers
                     codec       = resp.headers.get("X-Codec", "alac").lower()
