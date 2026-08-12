@@ -422,6 +422,11 @@ These are baseline observations, not authorization for an unbounded redesign. Ea
 - A full-index progress indicator disappears only after every current release
   has a successful local checkpoint. Matching completed indexes stay quiet on
   later launches; incomplete indexes keep an explicit remaining-work state.
+- Index percentage represents completed release checkpoints plus completed
+  songs and may use one decimal place near completion. It must advance as
+  large playlist pages finish rather than parking at a synthetic 99%.
+- The standalone Playlists grid omits the redundant workspace title bar. A
+  playlist detail page retains its title/back navigation header.
 - Downloaded releases use the same full-panel hero and track-list hierarchy as
   connected-library releases. Do not split the page into simultaneous grid and
   detail columns.

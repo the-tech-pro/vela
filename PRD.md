@@ -499,6 +499,7 @@ rewrite an attached device.
 | LIB-INDEX-007 | Run Apple and Downloaded indexing asynchronously and stage their startup work so navigation remains interactive. Both indexes expose bounded, determinate progress events and return cached content immediately. | Implemented |
 | LIB-INDEX-008 | Treat an Apple index as complete only when every current album and playlist detail is checkpointed successfully. Keep incomplete progress visible, retry transient failures, skip the progress surface on later launches after a matching complete index, and provide a confirmed Reset index action that preserves credentials and downloaded files. | Implemented |
 | LIB-INDEX-009 | Calculate full-library progress from the total track workload across every album and playlist, not merely the number of release requests. Reserve 100% exclusively for the explicit successful completion event. | Implemented |
+| LIB-INDEX-010 | Count every album/playlist checkpoint and every track as index work, and advance progress as track pages finish so a large final release cannot leave the indicator parked at 99%. | Implemented |
 | QUEUE-001 | Treat every song, album, playlist, or custom link request as a persistent job. Adding a request must never replace or cancel the active job. | Implemented |
 | QUEUE-002 | Restore waiting work after restart. Completed files are validated/reused and incomplete work resumes without duplicating valid output. | Implemented |
 | QUEUE-003 | Pause/resume prevents new tracks from starting without cancelling in-flight tracks. Queue cancellation requires confirmation. | Implemented |
@@ -518,6 +519,8 @@ Refresh library; it does not refresh immediately.
 - Recently Added presents locally indexed albums and playlists.
 - Albums and Playlists use consistent selectable grid cards and shared search,
   sort, filter, selection, download, and context-menu behaviour.
+- The standalone Playlists grid omits the redundant top title bar; an opened
+  playlist keeps the normal detail header and back navigation.
 - Favourites opens Apple Music's actual automatic Favourite Songs playlist,
   using its Apple-provided URL, artwork, track count, and a red star identity.
 - Artists lists library artists alphabetically with artwork when available and

@@ -16,6 +16,7 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import closing
@@ -201,8 +202,12 @@ class AppleLibraryClient:
         )
         release_total = len(targets)
         release_completed = 0
-        total = sum(weight for _, _, weight in targets)
+        # A release checkpoint and each of its tracks are separate units of
+        # real work. Large in-flight playlists can therefore advance progress.
+        total = release_total + sum(weight for _, _, weight in targets)
         completed = 0
+        track_progress = {url: 0 for url, _, _ in targets}
+        progress_lock = threading.Lock()
         target_urls = sorted(url for url, _, _ in targets)
         # Lists survive the JSON/SQLite cache round-trip unchanged. Tuples would
         # come back as lists and force an unnecessary full re-index every launch.
@@ -225,11 +230,22 @@ class AppleLibraryClient:
                     "total": total,
                     # 100 is reserved for the explicit complete event. This
                     # prevents rounding the final in-flight release to 100.
-                    "percent": min(99, int((completed / total) * 100)) if total else 99,
+                    "percent": min(99.9, round((completed / total) * 100, 1)) if total else 99.9,
                     "release_completed": release_completed,
                     "release_total": release_total,
                     "label": label,
                 })
+
+        def report_track_progress(url: str, label: str, weight: int, count: int):
+            nonlocal completed
+            with progress_lock:
+                bounded = min(weight, max(0, int(count or 0)))
+                previous = track_progress.get(url, 0)
+                if bounded <= previous:
+                    return
+                track_progress[url] = bounded
+                completed += bounded - previous
+                report(label)
 
         report("Preparing library index")
         pending = list(targets)
@@ -240,7 +256,13 @@ class AppleLibraryClient:
             failed = []
             with ThreadPoolExecutor(max_workers=4) as pool:
                 futures = {
-                    pool.submit(self.get_playlist_detail, url, False): (url, label, weight)
+                    pool.submit(
+                        self.get_playlist_detail,
+                        url,
+                        False,
+                        lambda count, target_url=url, target_label=label, target_weight=weight:
+                            report_track_progress(target_url, target_label, target_weight, count),
+                    ): (url, label, weight)
                     for url, label, weight in pending
                 }
                 for future in as_completed(futures):
@@ -248,11 +270,18 @@ class AppleLibraryClient:
                     try:
                         future.result()
                     except Exception as exc:
+                        with progress_lock:
+                            completed -= track_progress.get(url, 0)
+                            track_progress[url] = 0
+                            report(f"Retrying {label}")
                         failed.append((url, label, weight, str(exc)))
                     else:
-                        release_completed += 1
-                        completed += weight
-                        report(label)
+                        with progress_lock:
+                            remaining_tracks = weight - track_progress.get(url, 0)
+                            track_progress[url] = weight
+                            release_completed += 1
+                            completed += remaining_tracks + 1
+                            report(label)
             pending = [(url, label, weight) for url, label, weight, _ in failed]
             final_errors = [{"url": url, "message": message} for url, _, _, message in failed]
             if pending and attempt < 2:
@@ -262,7 +291,7 @@ class AppleLibraryClient:
         result = {
             "completed": completed,
             "total": total,
-            "percent": 100 if complete else (min(99, int((completed / total) * 100)) if total else 0),
+            "percent": 100 if complete else (min(99.9, round((completed / total) * 100, 1)) if total else 0),
             "release_completed": release_completed,
             "release_total": release_total,
             "errors": final_errors,
@@ -274,30 +303,32 @@ class AppleLibraryClient:
         self._cache.set("full-index-state-v2", result)
         return result
 
-    def get_playlist_detail(self, library_url: str, force_refresh: bool = False) -> dict:
+    def get_playlist_detail(self, library_url: str, force_refresh: bool = False, index_progress_callback=None) -> dict:
         """Return display-ready metadata without starting a download."""
         cache_key = f"detail-v2:{library_url}"
         if not force_refresh:
             cached = self._cache.get(cache_key)
             if cached:
+                if index_progress_callback:
+                    index_progress_callback(len(cached.get("tracks") or []))
                 cached["from_cache"] = True
                 return cached
         if library_url == APPLE_LIBRARY_SONGS_URL:
             name = "Favorite Songs"
             artwork = None
-            tracks = self.get_saved_songs_tracks(force_refresh=force_refresh)
+            tracks = self.get_saved_songs_tracks(force_refresh=force_refresh, index_progress_callback=index_progress_callback)
             content_type = "playlist"
         elif extract_apple_library_album_id(library_url):
             album_id = extract_apple_library_album_id(library_url)
             name, artwork = self._get_library_album_meta(album_id)
-            tracks = self.get_library_album_tracks(album_id, force_refresh=force_refresh)
+            tracks = self.get_library_album_tracks(album_id, force_refresh=force_refresh, index_progress_callback=index_progress_callback)
             content_type = "album"
         else:
             playlist_id = extract_apple_library_playlist_id(library_url)
             if not playlist_id:
                 raise ValueError("Invalid Apple Music library playlist URL.")
             name, artwork = self._get_library_playlist_meta(playlist_id)
-            tracks = self.get_library_playlist_tracks(playlist_id, force_refresh=force_refresh)
+            tracks = self.get_library_playlist_tracks(playlist_id, force_refresh=force_refresh, index_progress_callback=index_progress_callback)
             content_type = "playlist"
 
         result = {
@@ -342,11 +373,16 @@ class AppleLibraryClient:
         tracks.sort(key=lambda item: (str(item.get("album") or "").casefold(), int(item.get("position") or 0), str(item.get("title") or "").casefold()))
         return {"name": artist_name, "content_type": "artist", "track_count": len(tracks), "from_cache": True, "tracks": tracks}
 
-    def get_saved_songs_tracks(self, page_callback=None, force_refresh: bool = False) -> list[TrackMetadata]:
+    def get_saved_songs_tracks(self, page_callback=None, force_refresh: bool = False, index_progress_callback=None) -> list[TrackMetadata]:
         items = None if force_refresh else self._cache.get("tracks:songs")
         if not isinstance(items, list):
-            items = list(self._iter_collection("/songs", params={"limit": 100}, parallel=True))
+            items = list(self._iter_collection(
+                "/songs", params={"limit": 100}, parallel=True,
+                item_progress_callback=index_progress_callback,
+            ))
             self._cache.set("tracks:songs", items)
+        elif index_progress_callback:
+            index_progress_callback(len(items))
         tracks: list[TrackMetadata] = []
         for item in items:
             meta = self._library_song_to_metadata(item)
@@ -369,14 +405,19 @@ class AppleLibraryClient:
         return tracks
 
     def get_library_playlist_tracks(
-        self, playlist_id: str, page_callback=None, force_refresh: bool = False
+        self, playlist_id: str, page_callback=None, force_refresh: bool = False, index_progress_callback=None
     ) -> list[TrackMetadata]:
         playlist_name, playlist_artwork = self._get_library_playlist_meta(playlist_id)
         items = None if force_refresh else self._cache.get(f"tracks:playlist:{playlist_id}")
         if not isinstance(items, list):
             path = f"/playlists/{playlist_id}/tracks"
-            items = list(self._iter_collection(path, params={"limit": 100}, parallel=True))
+            items = list(self._iter_collection(
+                path, params={"limit": 100}, parallel=True,
+                item_progress_callback=index_progress_callback,
+            ))
             self._cache.set(f"tracks:playlist:{playlist_id}", items)
+        elif index_progress_callback:
+            index_progress_callback(len(items))
         tracks: list[TrackMetadata] = []
         for item in items:
             meta = self._library_song_to_metadata(item)
@@ -400,13 +441,18 @@ class AppleLibraryClient:
         return tracks
 
     def get_library_album_tracks(
-        self, album_id: str, page_callback=None, force_refresh: bool = False
+        self, album_id: str, page_callback=None, force_refresh: bool = False, index_progress_callback=None
     ) -> list[TrackMetadata]:
         album_name, _ = self._get_library_album_meta(album_id)
         items = None if force_refresh else self._cache.get(f"tracks:album:{album_id}")
         if not isinstance(items, list):
-            items = list(self._iter_collection(f"/albums/{album_id}/tracks", {"limit": 100}, parallel=True))
+            items = list(self._iter_collection(
+                f"/albums/{album_id}/tracks", {"limit": 100}, parallel=True,
+                item_progress_callback=index_progress_callback,
+            ))
             self._cache.set(f"tracks:album:{album_id}", items)
+        elif index_progress_callback:
+            index_progress_callback(len(items))
         tracks: list[TrackMetadata] = []
         for item in items:
             meta = self._library_song_to_metadata(item)
@@ -535,13 +581,22 @@ class AppleLibraryClient:
             logger.debug("[AppleLibrary] album meta lookup failed for %s: %s", album_id, exc)
         return "Apple Music Album", None
 
-    def _iter_collection(self, path: str, params: Optional[dict] = None, parallel: bool = False):
+    def _iter_collection(self, path: str, params: Optional[dict] = None, parallel: bool = False, item_progress_callback=None):
+        progress_count = 0
+
+        def report_items(count: int):
+            nonlocal progress_count
+            progress_count += count
+            if item_progress_callback:
+                item_progress_callback(progress_count)
+
         if parallel and not path.startswith("http"):
             initial_params = dict(params or {})
             limit = min(max(int(initial_params.get("limit") or 100), 1), 100)
             initial_params["limit"] = limit
             first = self._get_json(path, params=initial_params)
             first_items = first.get("data") or []
+            report_items(len(first_items))
             for item in first_items:
                 yield item
             total = (first.get("meta") or {}).get("total")
@@ -554,7 +609,9 @@ class AppleLibraryClient:
                         for offset in offsets
                     }
                     for future in as_completed(futures):
-                        pages[futures[future]] = future.result().get("data") or []
+                        page_items = future.result().get("data") or []
+                        pages[futures[future]] = page_items
+                        report_items(len(page_items))
                 for offset in sorted(pages):
                     yield from pages[offset]
                 return
@@ -562,7 +619,9 @@ class AppleLibraryClient:
             pages = 1
             while next_ref and pages < 200:
                 payload = self._get_json(next_ref)
-                yield from payload.get("data") or []
+                page_items = payload.get("data") or []
+                report_items(len(page_items))
+                yield from page_items
                 next_ref = payload.get("next")
                 pages += 1
             return
@@ -574,7 +633,9 @@ class AppleLibraryClient:
         while next_ref and pages < 200:
             payload = self._get_json(next_ref, params=next_params)
             next_params = None
-            for item in payload.get("data") or []:
+            page_items = payload.get("data") or []
+            report_items(len(page_items))
+            for item in page_items:
                 yield item
 
             next_ref = payload.get("next")

@@ -1211,7 +1211,7 @@
     EventsOn("apple-index-event", (payload: any) => {
       if (payload?.type === 'apple_index_progress') {
         appleIndexing = true;
-        appleIndexPercent = Math.max(0, Math.min(99, Number(payload.percent || 0)));
+        appleIndexPercent = Math.max(0, Math.min(99.9, Number(payload.percent || 0)));
         appleIndexLabel = payload.label || '';
       } else if (payload?.type === 'apple_index_complete') {
         appleIndexPercent = 100;
@@ -1223,7 +1223,7 @@
         const total = Number(payload?.data?.total || 0);
         appleIndexStarted = false;
         appleIndexing = true;
-        appleIndexPercent = Math.max(0, Math.min(99, Number(payload?.data?.percent || 0)));
+        appleIndexPercent = Math.max(0, Math.min(99.9, Number(payload?.data?.percent || 0)));
         appleIndexLabel = `Index incomplete · ${Math.max(0, total - completed)} remaining`;
       }
     });
@@ -2578,6 +2578,7 @@
     </aside>
 
     <section class="workspace">
+      {#if !(currentPage === 'library' && libraryView === 'playlists' && !showAppleLibraryDetail)}
       <header class="topbar">
         <div>
           {#if currentPage === 'library' && showAppleLibraryDetail && libraryView !== 'favourites'}<button class="topbar-back" aria-label="Back to library" on:click={closeAppleLibraryDetail}><ArrowLeft size={20}/></button>{/if}
@@ -2591,6 +2592,7 @@
           {#if currentPage === 'downloads'}<button class="primary compact add-custom-button" on:click={() => { customDestination = config.download_path; showCustomDownload = true; }}><Plus size={16}/><span>Add custom</span></button>{/if}
         </div>
       </header>
+      {/if}
 
       <main class="page-content">
         {#if currentPage === 'library'}

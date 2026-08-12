@@ -42,8 +42,14 @@ class AppleLibraryURLTests(unittest.TestCase):
             }
 
         self.client._get_json = MagicMock(side_effect=fake_get)
-        items = list(self.client._iter_collection("/albums", {"limit": 2}, parallel=True))
+        progress = []
+        items = list(self.client._iter_collection(
+            "/albums", {"limit": 2}, parallel=True,
+            item_progress_callback=progress.append,
+        ))
         self.assertEqual([item["id"] for item in items], ["0", "1", "2", "3", "4", "5"])
+        self.assertEqual(progress[-1], 6)
+        self.assertEqual(progress, sorted(progress))
 
     def test_library_index_is_persistent_and_account_scoped(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -69,17 +75,30 @@ class AppleLibraryURLTests(unittest.TestCase):
             ],
             "playlists": [],
         })
-        self.client.get_playlist_detail = MagicMock(return_value={"tracks": []})
+        weights = {
+            "apple-music://library/album/small": 10,
+            "apple-music://library/album/large": 90,
+        }
+
+        def index_detail(url, _force_refresh, progress_callback):
+            weight = weights[url]
+            progress_callback(weight // 2)
+            progress_callback(weight)
+            return {"tracks": [{}] * weight}
+
+        self.client.get_playlist_detail = MagicMock(side_effect=index_detail)
         events = []
 
         result = self.client.index_entire_library(progress_callback=events.append)
 
         self.assertTrue(result["complete"])
-        self.assertEqual(result["completed"], 100)
-        self.assertEqual(result["total"], 100)
+        self.assertEqual(result["completed"], 102)
+        self.assertEqual(result["total"], 102)
         self.assertTrue(events)
-        self.assertTrue(all(0 <= event["percent"] <= 99 for event in events))
-        self.assertTrue(any(event["percent"] in (10, 90) for event in events))
+        percentages = [event["percent"] for event in events]
+        self.assertTrue(all(0 <= percent <= 99.9 for percent in percentages))
+        self.assertEqual(percentages, sorted(percentages))
+        self.assertGreater(len(set(percentages)), 3)
 
 
 if __name__ == "__main__":
