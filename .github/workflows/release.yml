@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-build-windows:
+    name: Test and build Vela for Windows
+    runs-on: windows-latest
+    env:
+      WAILS_VERSION: v2.12.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache-dependency-path: antra-wails/go.sum
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: npm
+          cache-dependency-path: antra-wails/frontend/package-lock.json
+
+      - name: Run Python tests
+        run: python -m unittest discover tests
+
+      - name: Run Go tests
+        working-directory: antra-wails
+        run: go test ./...
+
+      - name: Install Python build dependencies
+        run: pip install -r requirements-desktop.txt
+
+      - name: Install Wails CLI
+        run: go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+
+      - name: Build Python backend
+        working-directory: antra-wails
+        run: pyinstaller backend_runtime.spec --distpath runtime/backend --noconfirm
+
+      - name: Build Vela
+        working-directory: antra-wails
+        run: wails build -clean
+
+      - name: Upload Vela
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vela-Windows
+          path: antra-wails/build/bin/Vela.exe

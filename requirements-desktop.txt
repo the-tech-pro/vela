@@ -1,0 +1,4 @@
+-r requirements-runtime.txt
+pyinstaller>=6.15.0
+wheel>=0.45.0
+iopenpod==1.67.1
