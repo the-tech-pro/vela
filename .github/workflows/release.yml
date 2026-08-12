@@ -36,6 +36,14 @@ jobs:
       - name: Run Python tests
         run: python -m unittest discover tests
 
+      - name: Install frontend dependencies
+        working-directory: antra-wails/frontend
+        run: npm ci
+
+      - name: Build frontend assets
+        working-directory: antra-wails/frontend
+        run: npm run build
+
       - name: Run Go tests
         working-directory: antra-wails
         run: go test ./...
