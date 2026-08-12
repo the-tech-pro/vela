@@ -2,6 +2,7 @@ export namespace main {
 	
 	export class Config {
 	    download_path: string;
+	    download_path_is_library_root?: boolean;
 	    apple_enabled: boolean;
 	    apple_authorization_token?: string;
 	    apple_music_user_token?: string;
@@ -69,6 +70,7 @@ export namespace main {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.download_path = source["download_path"];
+	        this.download_path_is_library_root = source["download_path_is_library_root"];
 	        this.apple_enabled = source["apple_enabled"];
 	        this.apple_authorization_token = source["apple_authorization_token"];
 	        this.apple_music_user_token = source["apple_music_user_token"];

@@ -2462,10 +2462,14 @@ def main():
             # Map settings to env vars for antra config to pick up
             if "download_path" in settings:
                 configured_root = os.path.abspath(os.path.expanduser(settings["download_path"]))
-                os.environ["OUTPUT_DIR"] = (
-                    configured_root if os.path.basename(configured_root).lower() == "apple music"
-                    else os.path.join(configured_root, "Apple Music")
-                )
+                # Desktop config now stores the actual library root. Legacy
+                # parent paths are also recognized here because the backend
+                # reads config.json directly and may start before Settings has
+                # persisted the Go-side migration.
+                if not settings.get("download_path_is_library_root"):
+                    legacy_root = os.path.join(configured_root, "Apple Music")
+                    configured_root = legacy_root if os.path.isdir(legacy_root) else os.path.join(configured_root, "Vela")
+                os.environ["OUTPUT_DIR"] = configured_root
             if "max_concurrent_jobs" in settings:
                 os.environ["ANTRA_MAX_WORKERS"] = str(max(1, min(8, int(settings["max_concurrent_jobs"] or 2))))
             if settings.get("spotify_sp_dc"):
@@ -2653,7 +2657,9 @@ def main():
             if args.apple_library_index:
                 data = client.index_entire_library(
                     progress_callback=lambda progress: print(json.dumps({"type": "apple_index_progress", **progress}), flush=True),
-                    force_refresh_summary=False,
+                    # Refresh the compact summary in the background while every
+                    # already-indexed detail continues to be served locally.
+                    force_refresh_summary=True,
                 )
                 event_type = "apple_index_complete" if data.get("complete") else "apple_index_incomplete"
                 print(json.dumps({"type": event_type, "data": data}), flush=True)
@@ -2856,6 +2862,7 @@ def main():
         # ─────────────────────────────────────────────────────────────────────
 
         try:
+            _emit({"type": "job_preparing", "stage": "metadata", "message": "Reading album, playlist, and song information…"})
             print(json.dumps({"type": "log", "level": "info", "message": f"Syncing playlist to library: {url}"}))
             # Progressive page callback — fires after each 1000-track GraphQL page.
             # First call emits playlist_loaded (partial), subsequent calls emit tracks_appended.
@@ -2947,6 +2954,7 @@ def main():
                     ],
                 }), flush=True)
 
+            _emit({"type": "job_preparing", "stage": "sources", "message": "Preparing source matching and download folders…"})
             tracks = service.enrich_tracks_for_download(tracks, url, options=options)
 
             from antra.core.control import DownloadController

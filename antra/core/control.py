@@ -54,8 +54,7 @@ class DownloadController:
     def release_worker_slot(self) -> None:
         with self._condition:
             self._active_workers = max(0, self._active_workers - 1)
-            with self._condition:
-                self._condition.notify_all()
+            self._condition.notify_all()
 
     def _refresh_external_state(self) -> None:
         if not self._control_path or time.monotonic() - self._last_control_check < 0.15:

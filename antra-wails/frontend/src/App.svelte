@@ -1,16 +1,18 @@
 <script lang="ts">
   import { onMount, tick } from 'svelte';
-  import { GetConfig, SaveConfig, PickDirectory, StartDownload, RetryTrackDownload, CancelDownload, PauseDownload, ResumeDownload, SetDownloadWorkerCount, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, CaptureSpDC } from '../wailsjs/go/main/App.js';
+  import { GetConfig, SaveConfig, PickDirectory, GetSuggestedDownloadLocation, StartDownload, RetryTrackDownload, CancelDownload, PauseDownload, ResumeDownload, SetDownloadWorkerCount, GetHistory, AddHistory, ClearHistory, ValidateTidalAuth, StartTidalOAuthLogin, StartAppleBrowserLogin, StartAmazonBrowserLogin, ConfirmAmazonLogin, CaptureSpDC } from '../wailsjs/go/main/App.js';
   import { GetArtistDiscography, SearchArtists, CheckSourceHealth, GetDownloadedMusicLibrary, RefreshDownloadedMusicLibrary, GetDownloadedRelease, GetAppleMusicLibrary, RefreshAppleMusicLibrary, GetAppleMusicPlaylistDetail, GetAppleMusicArtistDetail, StartAppleMusicIndex, ResetAppleMusicIndex, GetIPodDevices, RunAutoSync, GetTrackLyrics } from '../wailsjs/go/main/App.js';
   import { EventsOn, ClipboardGetText } from '../wailsjs/runtime/runtime.js';
   import type { main } from '../wailsjs/go/models';
   import { Library, Download, HardDriveDownload, Users, Compass, Settings, Plus, Search, Smartphone,
     WifiOff, SlidersHorizontal, ArrowUpDown, MoreHorizontal, Check, Circle,
     LoaderCircle, Clock3, ChevronDown, RefreshCw, X, FolderOpen, ArrowLeft,
-    Star, Album, ListMusic, UserRound, Pause, Play, FileText } from 'lucide-svelte';
+    Star, Album, ListMusic, UserRound, Pause, Play, FileText, ChevronUp,
+    Trash2, SkipForward } from 'lucide-svelte';
 
   let config: main.Config = {
     download_path: '',
+    download_path_is_library_root: true,
     sources_enabled: [],
     first_run_complete: false,
     apple_enabled: true,
@@ -54,7 +56,7 @@
     strict_matching: false,
     download_source: 'auto',
     download_sources: ['auto'],
-    save_cover_art_sidecar: false,
+    save_cover_art_sidecar: true,
     single_track_filename_template: '{artist} - {title}',
     album_track_filename_template: '{track} - {title}',
     folder_structure_template: '{album_artist}/{year} - {album}',
@@ -208,13 +210,39 @@
   let showCustomDownload = false;
   let customDestination = '';
   let isDownloading = false;
-  interface DownloadJob { id: string; url: string; title: string; artwork?: string; status: 'waiting' | 'downloading' | 'downloaded' | 'failed' | 'cancelled'; total: number; completed: number; }
+  let jobPreparationStatus = 'Reading release information…';
+  interface DownloadJob { id: string; url: string; title: string; artwork?: string; status: 'waiting' | 'paused' | 'downloading' | 'downloaded' | 'failed' | 'cancelled'; total: number; completed: number; }
   let downloadJobs: DownloadJob[] = [];
   type AppPage = 'library' | 'downloads' | 'downloaded' | 'devices' | 'settings';
   let currentPage: AppPage = 'library';
   let queuePaused = false;
+  let priorityJobId = '';
   let showDownloadLogs = false;
   const queueStorageKey = 'vela-download-queue-v2';
+  let toastMessage = '';
+  let toastTone: 'error' | 'warning' | 'success' = 'error';
+  let toastTimer: ReturnType<typeof setTimeout> | null = null;
+  let confirmDialog: { title: string; message: string; confirmLabel: string; danger: boolean } | null = null;
+  let confirmResolver: ((confirmed: boolean) => void) | null = null;
+
+  function showToast(message: string, tone: 'error' | 'warning' | 'success' = 'error') {
+    toastMessage = message;
+    toastTone = tone;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toastMessage = ''; toastTimer = null; }, 7000);
+  }
+
+  function requestConfirmation(title: string, message: string, confirmLabel: string, danger = true): Promise<boolean> {
+    confirmDialog = { title, message, confirmLabel, danger };
+    return new Promise(resolve => { confirmResolver = resolve; });
+  }
+
+  function resolveConfirmation(confirmed: boolean) {
+    const resolve = confirmResolver;
+    confirmDialog = null;
+    confirmResolver = null;
+    resolve?.(confirmed);
+  }
 
   function persistDownloadQueue() {
     if (!uiDemoMode) localStorage.setItem(queueStorageKey, JSON.stringify({ jobs: downloadJobs, paused: queuePaused }));
@@ -223,7 +251,7 @@
   function restoreDownloadQueue() {
     try {
       const saved = JSON.parse(localStorage.getItem(queueStorageKey) || '{}');
-      downloadJobs = (saved.jobs || []).map((job: DownloadJob) => job.status === 'downloading' ? { ...job, status: 'waiting' as const } : job);
+      downloadJobs = (saved.jobs || []).map((job: DownloadJob) => job.status === 'downloading' ? { ...job, status: 'paused' as const } : job);
       queuePaused = !!saved.paused;
     } catch {
       downloadJobs = [];
@@ -350,6 +378,10 @@
     playlists: AppleLibraryPlaylistItem[];
     from_cache?: boolean;
     indexed_at?: number;
+    index_complete?: boolean;
+    details?: Record<string, AppleLibraryDetail>;
+    artists?: { name: string; image_url?: string; track_count: number }[];
+    artist_details?: Record<string, AppleLibraryDetail>;
   }
   let appleLibrary: AppleLibraryData | null = null;
   let appleLibraryLoading = false;
@@ -531,13 +563,25 @@
   function startAppleIndexOnce() {
     if (uiDemoMode || appleIndexStarted || !config.apple_music_user_token || !config.apple_authorization_token) return;
     appleIndexStarted = true;
+    appleIndexing = true;
+    appleIndexPercent = 0;
+    appleIndexLabel = 'Reading local library index';
     StartAppleMusicIndex().catch(() => {
       appleIndexing = false;
       appleIndexStarted = false;
     });
   }
 
-  async function loadAppleMusicLibrary(forceRefresh = false) {
+  function ingestAppleLibrarySnapshot(data: AppleLibraryData) {
+    for (const [url, detail] of Object.entries(data.details || {})) {
+      appleDetailCache.set(url, detail);
+    }
+    for (const [key, detail] of Object.entries(data.artist_details || {})) {
+      appleDetailCache.set(`artist:${key}`, detail);
+    }
+  }
+
+  async function loadAppleMusicLibrary(forceRefresh = false, startIndexer = true) {
     if (!config.apple_music_user_token || !config.apple_authorization_token) return;
     appleLibraryLoading = !appleLibrary;
     appleLibraryError = '';
@@ -548,12 +592,13 @@
         appleLibraryError = data.error;
       } else {
         appleLibrary = data as AppleLibraryData;
+        ingestAppleLibrarySnapshot(appleLibrary);
         for (const imageURL of [...appleLibrary.albums, ...appleLibrary.playlists].map(item => item.image_url).filter(Boolean)) {
           const image = new Image();
           image.decoding = 'async';
           image.src = imageURL as string;
         }
-        setTimeout(startAppleIndexOnce, 500);
+        if (startIndexer) setTimeout(startAppleIndexOnce, 500);
         if (libraryView === 'favourites' && !showAppleLibraryDetail) setTimeout(openFavourites, 0);
       }
     } catch (e: any) {
@@ -602,13 +647,16 @@
     });
   $: if (libraryDetailDescending) visibleLibraryDetailTracks.reverse();
 
-  function libraryArtists(): { name: string; albums: AppleLibraryAlbumItem[]; image?: string | null }[] {
+  function libraryArtists(): { name: string; albums: AppleLibraryAlbumItem[]; image?: string | null; trackCount: number }[] {
+    if (appleLibrary?.artists?.length) {
+      return appleLibrary.artists.map(artist => ({ name: artist.name, albums: [], image: artist.image_url || null, trackCount: artist.track_count }));
+    }
     const groups = new Map<string, AppleLibraryAlbumItem[]>();
     for (const album of appleLibrary?.albums || []) {
       const name = album.artist_name || 'Unknown Artist';
       groups.set(name, [...(groups.get(name) || []), album]);
     }
-    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, albums]) => ({ name, albums, image: albums.find(a => a.image_url)?.image_url }));
+    return [...groups.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([name, albums]) => ({ name, albums, image: albums.find(a => a.image_url)?.image_url, trackCount: albums.reduce((sum, album) => sum + (album.track_count || 0), 0) }));
   }
 
   function openLibraryItemMenu(event: MouseEvent, item: AppleLibraryAlbumItem | AppleLibraryPlaylistItem) {
@@ -636,7 +684,7 @@
   }
 
   async function resetAppleIndex() {
-    if (!confirm('Reset the local Apple Music index? Your connection and downloaded files will not be removed.')) return;
+    if (!await requestConfirmation('Reset library index?', 'Vela will rebuild all cached Apple Music albums, playlists, artists, and songs. Your connection and downloaded files will not be removed.', 'Reset index')) return;
     try {
       await ResetAppleMusicIndex();
       appleDetailCache.clear();
@@ -650,6 +698,7 @@
       await loadAppleMusicLibrary(true);
     } catch (e: any) {
       appleLibraryError = e?.message || String(e);
+      showToast(`Could not reset the library index: ${appleLibraryError}`);
     }
   }
 
@@ -898,6 +947,19 @@
 
   function scrollTracklistToBottom() {
     if (tracklistEl) { tracklistEl.scrollTop = tracklistEl.scrollHeight; tracklistAtBottom = true; }
+  }
+
+  async function autoScrollTracklist(trackKey = '') {
+    await tick();
+    if (!tracklistEl) return;
+    if (trackKey) {
+      const row = tracklistEl.querySelector(`[data-track-key="${CSS.escape(trackKey)}"]`) as HTMLElement | null;
+      if (row) {
+        tracklistEl.scrollTo({ top: Math.max(0, row.offsetTop - tracklistEl.clientHeight / 2), behavior: 'smooth' });
+        return;
+      }
+    }
+    tracklistEl.scrollTo({ top: tracklistEl.scrollHeight, behavior: 'smooth' });
   }
 
   async function pasteClipboardIntoUrlBox(event: MouseEvent) {
@@ -1162,7 +1224,7 @@
       selectedDownloadSources = normalizeDownloadSources();
       config = { ...config, download_sources: selectedDownloadSources };
       if (typeof config.save_cover_art_sidecar !== 'boolean') {
-        config.save_cover_art_sidecar = false;
+        config.save_cover_art_sidecar = true;
       }
       // Template defaults
       if (!config.single_track_filename_template) config.single_track_filename_template = '{artist} - {title}';
@@ -1211,20 +1273,31 @@
     EventsOn("apple-index-event", (payload: any) => {
       if (payload?.type === 'apple_index_progress') {
         appleIndexing = true;
-        appleIndexPercent = Math.max(0, Math.min(99.9, Number(payload.percent || 0)));
+        appleIndexPercent = Math.round(Math.max(0, Math.min(99, Number(payload.percent || 0))));
         appleIndexLabel = payload.label || '';
       } else if (payload?.type === 'apple_index_complete') {
         appleIndexPercent = 100;
         appleIndexLabel = 'Library indexed';
         appleIndexStarted = false;
+        void loadAppleMusicLibrary(false, false);
         setTimeout(() => { appleIndexing = false; }, 1800);
       } else if (payload?.type === 'apple_index_incomplete') {
         const completed = Number(payload?.data?.completed || 0);
         const total = Number(payload?.data?.total || 0);
         appleIndexStarted = false;
         appleIndexing = true;
-        appleIndexPercent = Math.max(0, Math.min(99.9, Number(payload?.data?.percent || 0)));
+        appleIndexPercent = Math.round(Math.max(0, Math.min(99, Number(payload?.data?.percent || 0))));
         appleIndexLabel = `Index incomplete · ${Math.max(0, total - completed)} remaining`;
+        const message = payload?.data?.errors?.[0]?.message || payload?.data?.errors?.[0] || 'Library indexing stopped before it finished. It will resume from the local checkpoint.';
+        showToast(String(message), 'warning');
+      } else if (payload?.type === 'apple_index_paused') {
+        appleIndexing = true;
+        appleIndexStarted = false;
+        appleIndexLabel = payload.label || 'Index paused while downloading';
+      } else if (payload?.type === 'apple_index_error' || payload?.type === 'error') {
+        appleIndexStarted = false;
+        appleIndexing = false;
+        showToast(payload.message || 'Library indexing failed.');
       }
     });
     EventsOn("downloaded-index-event", (payload: any) => {
@@ -1236,6 +1309,12 @@
         downloadedIndexPercent = 100;
         downloadedIndexLabel = 'Downloads indexed';
         downloadedIndexing = false;
+      } else if (payload?.type === 'error') {
+        downloadedIndexing = false;
+        downloadedIndexLabel = '';
+        showToast(payload.message || 'Downloaded music indexing failed.');
+      } else if (payload?.type === 'warning') {
+        showToast(payload.message || 'Some downloaded releases could not be indexed.', 'warning');
       }
       if (payload?.type === 'complete' && payload.library) {
         downloadedLibrary = {
@@ -1457,6 +1536,10 @@
   }
 
   function handleEvent(payload: any) {
+    if (payload.type === 'job_preparing') {
+      jobPreparationStatus = payload.message || 'Reading release information…';
+      return;
+    }
     if (payload.type === 'playlist_loaded') {
       playlistTitle = payload.title || '';
       playlistArtwork = payload.artwork_url || '';
@@ -1507,6 +1590,8 @@
       }
       trackLabels = { ...trackLabels };
       activeTracks = { ...activeTracks };
+      jobPreparationStatus = 'Starting song downloads…';
+      void autoScrollTracklist();
       return;
     }
 
@@ -1536,6 +1621,7 @@
         playlistTotalTracks = (playlistTotalTracks || 0) + newTracks2.length;
         playlistTotalDurationMs = (playlistTotalDurationMs || 0) + trkList2.reduce((s: number, t: any) => s + (t.duration_ms || 0), 0);
         currentPlaylistTrackCount += newTracks2.length;
+        void autoScrollTracklist();
       }
       return;
     }
@@ -1544,7 +1630,10 @@
       isDownloading = false;
       Object.keys(activeTracks).forEach(clearTrackInterval);
       const activeJob = downloadJobs.findIndex(job => job.status === 'downloading');
-      if (payload.status === 'cancelled') {
+      if (payload.status === 'paused') {
+        if (activeJob >= 0) downloadJobs[activeJob] = { ...downloadJobs[activeJob], status: 'paused' };
+        addLog('warning', 'Download paused at its latest completed song.');
+      } else if (payload.status === 'cancelled') {
         if (activeJob >= 0) downloadJobs[activeJob] = { ...downloadJobs[activeJob], status: 'cancelled' };
         addLog('warning', 'Download cancelled');
       } else if (payload.status === 'failed') {
@@ -1556,7 +1645,11 @@
       }
       downloadJobs = [...downloadJobs];
       persistDownloadQueue();
-      if (!queuePaused && payload.status !== 'cancelled') setTimeout(startNextQueuedJob, 0);
+      if (priorityJobId && payload.status === 'paused') priorityJobId = '';
+      if (!queuePaused && payload.status !== 'cancelled') {
+        void ResumeDownload();
+        setTimeout(startNextQueuedJob, 0);
+      }
       return;
     }
 
@@ -1606,6 +1699,8 @@
           retrying: false,
           trackData: data.track_data || activeTracks[trackKey]?.trackData,
         });
+        jobPreparationStatus = `Finding an audio source for ${trackLabel}…`;
+        void autoScrollTracklist(trackKey);
 
       } else if (name === 'track_resolved') {
         clearTrackInterval(trackKey);
@@ -2031,6 +2126,14 @@
     }
   }
 
+  async function useSuggestedDownloadLocation(kind: 'music' | 'downloads') {
+    const location = await GetSuggestedDownloadLocation(kind);
+    if (!location) return;
+    config.download_path = location;
+    config.download_path_is_library_root = true;
+    if (!setupMode) await autoSaveSettings();
+  }
+
   function closeDownloadedRelease() {
     downloadedSelectedRelease = null;
     downloadedSelectedPath = '';
@@ -2051,7 +2154,7 @@
 
   async function saveSetup() {
     if (!config.download_path) {
-      alert("Please select your Music Library folder.");
+      showToast('Please select your Music Library folder.', 'warning');
       return;
     }
     await SaveConfig(config);
@@ -2199,8 +2302,8 @@
   async function cancelDownload() {
     // A queue may be populated before the backend process reports itself as
     // active. Cancellation must still clear that queued-only state.
-    if (!isDownloading && !downloadJobs.some(job => ['waiting', 'downloading'].includes(job.status))) return;
-    if (!confirm('Cancel the current download and every waiting job?')) return;
+    if (!isDownloading && !downloadJobs.some(job => ['waiting', 'paused', 'downloading'].includes(job.status))) return;
+    if (!await requestConfirmation('Cancel all downloads?', 'The active download and every waiting or paused job will be removed from the queue.', 'Cancel downloads')) return;
     try {
       if (isDownloading) {
         await CancelDownload();
@@ -2208,7 +2311,7 @@
       }
       isDownloading = false;
       queuePaused = false;
-      downloadJobs = downloadJobs.map(job => ['waiting', 'downloading'].includes(job.status) ? { ...job, status: 'cancelled' } : job);
+      downloadJobs = downloadJobs.map(job => ['waiting', 'paused', 'downloading'].includes(job.status) ? { ...job, status: 'cancelled' } : job);
       persistDownloadQueue();
       Object.keys(activeTracks).forEach(clearTrackInterval);
       activeTracks = {};
@@ -2232,7 +2335,7 @@
   }
 
   async function clearHistory() {
-    if(confirm("Are you sure you want to clear your library build history?")) {
+    if(await requestConfirmation('Clear download history?', 'Completed job records will be removed. Downloaded music files will stay in your library.', 'Clear history')) {
       await ClearHistory();
       historyItems = [];
     }
@@ -2265,11 +2368,12 @@
     dismissedFailures = new Set();
     retryQueue = [];
     retryQueueTotal = 0;
+    jobPreparationStatus = 'Reading release information…';
   }
 
   async function startNextQueuedJob() {
     if (isDownloading || queuePaused) return;
-    const next = downloadJobs.findIndex(job => job.status === 'waiting');
+    const next = downloadJobs.findIndex(job => job.status === 'waiting' || job.status === 'paused');
     if (next < 0) return;
     resetActiveJobView();
     downloadJobs[next] = { ...downloadJobs[next], status: 'downloading' };
@@ -2277,6 +2381,7 @@
     persistDownloadQueue();
     isDownloading = true;
     shouldAutoScroll = true;
+    jobPreparationStatus = 'Starting the local download engine…';
     addLog('info', 'Preparing download…');
     try {
       await StartDownload([downloadJobs[next].url]);
@@ -2299,6 +2404,43 @@
       await ResumeDownload();
       if (!isDownloading) await startNextQueuedJob();
     }
+  }
+
+  function moveQueuedJob(jobId: string, direction: -1 | 1) {
+    const pendingIndexes = downloadJobs
+      .map((job, index) => ({ job, index }))
+      .filter(item => item.job.status === 'waiting' || item.job.status === 'paused');
+    const position = pendingIndexes.findIndex(item => item.job.id === jobId);
+    const swapPosition = position + direction;
+    if (position < 0 || swapPosition < 0 || swapPosition >= pendingIndexes.length) return;
+    const from = pendingIndexes[position].index;
+    const to = pendingIndexes[swapPosition].index;
+    [downloadJobs[from], downloadJobs[to]] = [downloadJobs[to], downloadJobs[from]];
+    downloadJobs = [...downloadJobs];
+    persistDownloadQueue();
+  }
+
+  async function runQueuedJobNow(jobId: string) {
+    const target = downloadJobs.find(job => job.id === jobId && (job.status === 'waiting' || job.status === 'paused'));
+    if (!target) return;
+    downloadJobs = [target, ...downloadJobs.filter(job => job.id !== jobId)];
+    queuePaused = false;
+    priorityJobId = jobId;
+    persistDownloadQueue();
+    if (isDownloading) {
+      await PauseDownload();
+    } else {
+      priorityJobId = '';
+      await ResumeDownload();
+      await startNextQueuedJob();
+    }
+  }
+
+  async function removeQueuedJob(jobId: string) {
+    const job = downloadJobs.find(item => item.id === jobId);
+    if (!job || !await requestConfirmation('Remove queued download?', `Remove “${job.title}” from the queue?`, 'Remove')) return;
+    downloadJobs = downloadJobs.filter(item => item.id !== jobId);
+    persistDownloadQueue();
   }
 
   async function autoSaveSettings() {
@@ -2571,14 +2713,14 @@
       </nav>
 
       <div class="sidebar-footer">
-        {#if appleIndexing || downloadedIndexing}<div class="sidebar-index" title={downloadedIndexing ? downloadedIndexLabel : appleIndexLabel}><span>{downloadedIndexing ? `Indexing downloads · ${downloadedIndexPercent}%` : `Indexing library · ${appleIndexPercent}%`}</span><progress max="100" value={downloadedIndexing ? downloadedIndexPercent : appleIndexPercent}></progress></div>{/if}
+        {#if appleIndexing || downloadedIndexing}<div class="sidebar-index" title={downloadedIndexing ? downloadedIndexLabel : appleIndexLabel}><span><span class="rotating-loader" aria-hidden="true"><LoaderCircle size={13}/></span>{downloadedIndexing ? `Indexing downloads · ${Math.round(downloadedIndexPercent)}%` : `Indexing library · ${Math.round(appleIndexPercent)}%`}</span><progress max="100" value={downloadedIndexing ? downloadedIndexPercent : appleIndexPercent}></progress></div>{/if}
         <button class="settings-nav" class:active={currentPage === 'downloads'} on:click={() => selectPage('downloads')}><Download size={18}/><span>Downloads</span></button>
         <button class="settings-nav" class:active={showSettings} on:click={() => openSettings()}><Settings size={18}/><span>Settings</span></button>
       </div>
     </aside>
 
     <section class="workspace">
-      {#if !(currentPage === 'library' && libraryView === 'playlists' && !showAppleLibraryDetail)}
+      {#if !(currentPage === 'library' && libraryView === 'favourites')}
       <header class="topbar">
         <div>
           {#if currentPage === 'library' && showAppleLibraryDetail && libraryView !== 'favourites'}<button class="topbar-back" aria-label="Back to library" on:click={closeAppleLibraryDetail}><ArrowLeft size={20}/></button>{/if}
@@ -2606,7 +2748,7 @@
               <div class="detail-track-tools"><div class="search-bar detail-search"><Search size={16}/><input bind:value={libraryDetailFilter} placeholder="Search songs" /></div><select bind:value={libraryDetailSort} aria-label="Sort songs"><option value="position">Playlist order</option><option value="title">Title</option><option value="artist">Artist</option><option value="album">Album</option></select><button class="secondary detail-order" on:click={() => libraryDetailDescending = !libraryDetailDescending}><ArrowUpDown size={16}/>{libraryDetailDescending ? 'Descending' : 'Ascending'}</button></div>
               {#if appleLibraryDetailError}<div class="detail-inline-error">{appleLibraryDetailError}</div>{/if}
               <div class="library-detail-tracks" class:loading={appleLibraryDetailLoading}>
-                {#if appleLibraryDetailLoading && !appleLibraryDetail.tracks.length}<p class="detail-index-note">{appleIndexing ? 'Indexing this release locally…' : 'Opening indexed songs…'}</p>{/if}
+                {#if appleLibraryDetailLoading && !appleLibraryDetail.tracks.length}<p class="detail-index-note">{appleLibrary?.index_complete ? 'Opening cached songs…' : (appleIndexing ? 'Indexing this release locally…' : 'Opening indexed songs…')}</p>{/if}
                 {#each visibleLibraryDetailTracks as track, i}<article><span class="detail-track-number">{i + 1}</span>{#if track.artwork_url}<img src={track.artwork_url} alt="" loading="lazy" decoding="async" />{:else}<span class="detail-track-placeholder"><Album size={17}/></span>{/if}<strong>{track.title}</strong><span>{track.artist}</span><span>{track.album}</span><small>{formatPlaybackTime((track.duration_ms || 0) / 1000)}</small><div class="track-more tool-menu"><button aria-label={`More options for ${track.title}`} on:click={() => detailTrackMenuIndex = detailTrackMenuIndex === i ? null : i}><MoreHorizontal size={17}/></button>{#if detailTrackMenuIndex === i}<div class="context-menu track-popover"><button on:click={() => { detailTrackMenuIndex = null; downloadOpenApplePlaylist(); }}><Download size={16}/> Download release</button></div>{/if}</div></article>{/each}
               </div>
             </section>
@@ -2638,21 +2780,24 @@
             </section>{/if}
             {#if libraryView === 'recent' || libraryView === 'playlists'}<section class="section-block"><div class="section-heading"><div><h2>Playlists</h2></div><span>{appleLibrary.playlists.length} playlists</span></div><div class="art-grid">{#each filteredLibraryPlaylists() as pl (pl.id)}<article class:selected={selectedLibraryItems.has(pl.url)} class="music-card selectable" on:contextmenu={(event) => openLibraryItemMenu(event, pl)}><button class="select-release" class:selected={selectedLibraryItems.has(pl.url)} aria-label={`Select ${pl.name}`} on:click|stopPropagation={() => toggleLibrarySelection(pl.url)}>{#if selectedLibraryItems.has(pl.url)}<Check size={15}/>{/if}</button><button class="artwork" on:click={() => openAppleLibraryDetail(pl.url, pl.name, pl.image_url || '')}>{#if pl.image_url}<img src={pl.image_url} alt="" loading="lazy" />{:else}<span class="art-placeholder"><ListMusic size={34}/></span>{/if}</button><div class="card-copy"><strong title={pl.name}>{pl.name}</strong><span>{pl.track_count ? `${pl.track_count} songs` : 'Indexed playlist'}</span></div></article>{/each}</div></section>{/if}
             {#if libraryView === 'favourites'}<section class="section-block">{#if favouriteSongsPlaylist()}<div class="art-grid"><article class="music-card featured-card"><button class="artwork gradient-art" on:click={openFavourites}><Star size={42}/></button><div class="card-copy"><strong>{favouriteSongsPlaylist()?.name}</strong><span>{favouriteSongsPlaylist()?.track_count || 0} songs</span></div></article></div>{:else}<div class="state-card"><Star size={34} class="favourite-empty-icon"/><h3>Favourite Songs wasn’t found</h3><p>Open Apple Music once so its automatic Favourite Songs playlist is available, then refresh the library index.</p></div>{/if}</section>{/if}
-            {#if libraryView === 'artists'}<section class="artist-library-list">{#each libraryArtists() as artist}<button on:click={() => openAppleArtistDetail(artist.name, artist.image || '')}><span class="artist-avatar">{#if artist.image}<img src={artist.image} alt="" />{:else}<UserRound size={22}/>{/if}</span><span><strong>{artist.name}</strong><small>{artist.albums.length} album{artist.albums.length === 1 ? '' : 's'} in your library</small></span><ChevronDown size={16}/></button>{/each}</section>{/if}
+            {#if libraryView === 'artists'}<section class="artist-library-list">{#each libraryArtists() as artist}<button on:click={() => openAppleArtistDetail(artist.name, artist.image || '')}><span class="artist-avatar">{#if artist.image}<img src={artist.image} alt="" />{:else}<UserRound size={22}/>{/if}</span><span><strong>{artist.name}</strong><small>{artist.trackCount} song{artist.trackCount === 1 ? '' : 's'} in your library</small></span><ChevronDown size={16}/></button>{/each}</section>{/if}
           {/if}
           {/key}
           {/if}
 
         {:else if currentPage === 'downloads'}
+          {#if isDownloading && !playlistTitle}
+            <section class="panel preparation-panel" aria-live="polite"><span class="rotating-loader" aria-hidden="true"><LoaderCircle size={22}/></span><div><p class="eyebrow">Preparing download</p><h2>Getting the job ready</h2><span>{jobPreparationStatus}</span></div></section>
+          {/if}
           {#if playlistTitle || trackOrder.length}
             <section class="panel session-panel">
               <div class="release-header">{#if playlistArtwork}<img src={playlistArtwork} alt="" />{:else}<div class="history-art"><Download size={22}/></div>{/if}<div><p class="eyebrow">Downloading now</p><h2>{playlistTitle || 'Preparing music…'}</h2><p>{queueFinishedCount}/{queueTrackKeys.length || playlistTotalTracks || '…'} songs</p></div><button class="icon-button" aria-label={queuePaused ? 'Resume queue' : 'Pause queue'} on:click={toggleQueuePause}>{#if queuePaused}<Play size={18}/>{:else}<Pause size={18}/>{/if}</button></div>
-              <div class="download-track-list" bind:this={tracklistEl}>{#each trackOrder.filter(key => !key.startsWith('__SEP__')) as key (key)}<article><span class="track-state-icon">{#if activeTracks[key]?.status === 'done' || activeTracks[key]?.status === 'skipped'}<Check size={16}/>{:else if activeTracks[key]?.status === 'downloading'}<LoaderCircle size={16} class="spin"/>{:else if activeTracks[key]?.status === 'failed'}<X size={16}/>{:else}<Clock3 size={16}/>{/if}</span><div><strong>{trackLabels[key] || key}</strong>{#if !['done','skipped'].includes(activeTracks[key]?.status)}<span>{activeTracks[key]?.text || 'Waiting'}</span>{/if}{#if activeTracks[key]?.status === 'downloading'}<progress max="100" value={activeTracks[key]?.progress || 0}></progress>{/if}</div></article>{/each}</div>
+              <div class="download-track-list" bind:this={tracklistEl} on:scroll={updateTracklistScroll}>{#each trackOrder.filter(key => !key.startsWith('__SEP__')) as key (key)}<article data-track-key={key}><span class="track-state-icon">{#if activeTracks[key]?.status === 'done' || activeTracks[key]?.status === 'skipped'}<Check size={16}/>{:else if activeTracks[key]?.status === 'downloading' || activeTracks[key]?.status === 'resolving'}<span class="rotating-loader" aria-hidden="true"><LoaderCircle size={16}/></span>{:else if activeTracks[key]?.status === 'failed'}<X size={16}/>{:else}<Clock3 size={16}/>{/if}</span><div><strong>{trackLabels[key] || key}</strong>{#if !['done','skipped'].includes(activeTracks[key]?.status)}<span>{activeTracks[key]?.text || 'Waiting'}</span>{/if}{#if activeTracks[key]?.status === 'downloading'}<progress max="100" value={activeTracks[key]?.progress || 0}></progress>{/if}</div></article>{/each}</div>
               {#if failedEntries.length}<div class="failure-strip"><strong>{failedEntries.length} track{failedEntries.length === 1 ? '' : 's'} need attention</strong><button on:click={retryAllFailed} disabled={isDownloading}>Retry all</button></div>{/if}
               <button class="log-toggle" on:click={() => showDownloadLogs = !showDownloadLogs}><FileText size={15}/>{showDownloadLogs ? 'Hide log' : 'Show more'}</button>{#if showDownloadLogs}<div class="clean-log">{#each logs as log}<p class={log.type}>{log.text.replace(/<[^>]+>/g, '')}</p>{/each}</div>{/if}
             </section>
           {/if}
-          {#if downloadJobs.some(job => job.status === 'waiting')}<div class="history-toolbar"><p>Queue</p><span>{downloadJobs.filter(job => job.status === 'waiting').length} waiting</span></div><div class="history-list job-list">{#each downloadJobs.filter(job => job.status === 'waiting') as job (job.id)}<article>{#if job.artwork}<img src={job.artwork} alt="" />{:else}<div class="history-art"><Clock3 size={20}/></div>{/if}<div><strong>{job.title}</strong><span>Waiting</span></div><span class="job-status waiting">queued</span></article>{/each}</div>{/if}
+          {#if downloadJobs.some(job => job.status === 'waiting' || job.status === 'paused')}<div class="history-toolbar"><p>Queue</p><span>{downloadJobs.filter(job => job.status === 'waiting' || job.status === 'paused').length} queued</span></div><div class="history-list job-list">{#each downloadJobs.filter(job => job.status === 'waiting' || job.status === 'paused') as job, queueIndex (job.id)}<article>{#if job.artwork}<img src={job.artwork} alt="" />{:else}<div class="history-art">{#if job.status === 'paused'}<Pause size={20}/>{:else}<Clock3 size={20}/>{/if}</div>{/if}<div><strong>{job.title}</strong><span>{job.status === 'paused' ? 'Paused · completed songs are saved' : 'Waiting'}</span></div><div class="queued-job-actions"><button aria-label="Move job up" title="Move up" disabled={queueIndex === 0} on:click={() => moveQueuedJob(job.id, -1)}><ChevronUp size={17}/></button><button aria-label="Download this job now" title="Download now" on:click={() => runQueuedJobNow(job.id)}><SkipForward size={17}/></button><button aria-label="Remove queued job" title="Remove" on:click={() => removeQueuedJob(job.id)}><Trash2 size={16}/></button></div></article>{/each}</div>{/if}
           <div class="history-toolbar"><p>{historyItems.length} completed job{historyItems.length === 1 ? '' : 's'}</p>{#if historyItems.length}<button class="danger-link" on:click={clearHistory}>Clear history</button>{/if}</div>
           {#if !historyItems.length && !trackOrder.length}<div class="state-card"><p>Queued and completed albums, playlists, and songs will appear here.</p></div>{:else}<div class="history-list">{#each historyItems as item}<article class:error={!!item.error}>{#if item.artwork_url}<img src={item.artwork_url} alt="" />{:else}<div class="history-art"><Download size={20}/></div>{/if}<div><strong>{item.title || item.url}</strong><span>{item.total || 0} songs · {new Date(item.date).toLocaleDateString()}</span>{#if item.error}<small>{item.error}</small>{/if}</div><details class="job-options"><summary aria-label="Job options"><MoreHorizontal size={18}/></summary><div><button on:click={() => { inputUrl = item.url; startDownload(); }}>Download again</button><button on:click={() => navigator.clipboard?.writeText(item.url || '')}>Copy link</button></div></details></article>{/each}</div>{/if}
 
@@ -2678,18 +2823,18 @@
         {#if showSettings}
           <div class="settings-overlay" role="presentation" on:click|self={() => showSettings = false}>
             <section class="settings-dialog" role="dialog" aria-modal="true" aria-label="Settings">
-              <header class="settings-dialog-header"><div><p class="eyebrow">Preferences</p><h1>Settings</h1></div><div class="settings-header-actions">{#if settingsPage === 'apple'}<button class="secondary compact" on:click={() => loadAppleMusicLibrary(true)} disabled={appleLibraryLoading}><RefreshCw size={15}/> Refresh library index</button><button class="danger-link compact" on:click={resetAppleIndex}>Reset index</button>{/if}<button class="close-settings" aria-label="Close settings" on:click={() => showSettings = false}><X size={18}/></button></div></header>
+              <header class="settings-dialog-header"><div><p class="eyebrow">Preferences</p><h1>Settings</h1></div><div class="settings-header-actions"><button class="close-settings" aria-label="Close settings" on:click={() => showSettings = false}><X size={18}/></button></div></header>
               <div class="settings-shell">
                 <nav class="settings-tabs" aria-label="Settings pages"><button class:active={settingsPage === 'general'} on:click={() => settingsPage = 'general'}><Settings size={17}/> General</button><button class:active={settingsPage === 'apple'} on:click={() => settingsPage = 'apple'}><Library size={17}/> Apple Music</button><button class:active={settingsPage === 'downloads'} on:click={() => settingsPage = 'downloads'}><Download size={17}/> Downloads</button><button class:active={settingsPage === 'audio'} on:click={() => settingsPage = 'audio'}><SlidersHorizontal size={17}/> Audio & sources</button><button class:active={settingsPage === 'discovery'} on:click={() => settingsPage = 'discovery'}><Compass size={17}/> Discover</button><button class:active={settingsPage === 'naming'} on:click={() => settingsPage = 'naming'}><FolderOpen size={17}/> File naming</button><button class:active={settingsPage === 'providers'} on:click={() => settingsPage = 'providers'}><MoreHorizontal size={17}/> Providers</button></nav>
                 <div class="settings-layout" data-page={settingsPage} on:change={autoSaveSettings}>
-            {#if settingsPage === 'downloads'}<section class="settings-section" id="settings-downloads"><div class="settings-heading"><div><p class="eyebrow">Downloads</p><h2>Performance</h2></div></div><div class="setting-row"><div><strong>Concurrent song downloads</strong><span>Vela uses a bounded worker pool. Two is a safe default; higher values may trigger provider limits.</span></div><input class="number-input" type="number" min="1" max="8" bind:value={config.max_concurrent_jobs} /></div><div class="setting-row"><div><strong>Destination</strong><span>{config.download_path || 'Not selected'}\Apple Music</span></div><button class="secondary" on:click={pickDir}>Change parent</button></div></section>{/if}
-            {#if settingsPage === 'general'}<section class="settings-section" id="settings-general"><div class="settings-heading"><div><p class="eyebrow">General</p><h2>Appearance & Library</h2></div></div><div class="setting-row"><div><strong>Appearance</strong><span>Follow the system or choose a fixed mode.</span></div><div class="appearance-control large"><button class:active={appearance === 'system'} on:click={() => applyAppearance('system')}>System</button><button class:active={appearance === 'light'} on:click={() => applyAppearance('light')}>Light</button><button class:active={appearance === 'dark'} on:click={() => applyAppearance('dark')}>Dark</button></div></div><div class="setting-row"><div><strong>Apple Music folder</strong><span>{config.download_path || 'Not selected'}\Apple Music</span></div><button class="secondary" on:click={pickDir}>Change parent</button></div><div class="setting-row"><div><strong>Library mode</strong><span>Reuse local audio while materializing every requested album and playlist folder.</span></div><select bind:value={config.library_mode}><option value="smart_dedup">Reuse local audio</option><option value="full_albums">Download every copy</option></select></div></section>{/if}
+            {#if settingsPage === 'downloads'}<section class="settings-section" id="settings-downloads"><div class="settings-heading"><div><p class="eyebrow">Downloads</p><h2>Performance</h2></div></div><div class="setting-row"><div><strong>Concurrent song downloads</strong><span>One queued release runs at a time. Vela starts this many songs from it in parallel; changes apply live without cancelling active songs. Eight is the provider, CPU, and disk safety ceiling.</span></div><input class="number-input" type="number" min="1" max="8" bind:value={config.max_concurrent_jobs} /></div><div class="setting-row download-location-row"><div class="path-copy"><strong>Music library location</strong><span>{config.download_path || 'Not selected'}</span></div><button class="secondary browse-location" on:click={pickDir}><FolderOpen size={16}/> Browse</button></div></section>{/if}
+            {#if settingsPage === 'general'}<section class="settings-section" id="settings-general"><div class="settings-heading"><div><p class="eyebrow">General</p><h2>Appearance & Library</h2></div></div><div class="setting-row"><div><strong>Appearance</strong><span>Follow the system or choose a fixed mode.</span></div><div class="appearance-control large"><button class:active={appearance === 'system'} on:click={() => applyAppearance('system')}>System</button><button class:active={appearance === 'light'} on:click={() => applyAppearance('light')}>Light</button><button class:active={appearance === 'dark'} on:click={() => applyAppearance('dark')}>Dark</button></div></div><div class="setting-row"><div><strong>Music library folder</strong><span>{config.download_path || 'Not selected'}</span></div><button class="secondary" on:click={() => settingsPage = 'downloads'}>Location options</button></div><div class="setting-row"><div><strong>Library mode</strong><span>Reuse local audio while materializing every requested album and playlist folder.</span></div><select bind:value={config.library_mode}><option value="smart_dedup">Reuse local audio</option><option value="full_albums">Download every copy</option></select></div></section>{/if}
 
             <section class="settings-section" id="settings-audio"><div class="settings-heading"><div><p class="eyebrow">Add Music</p><h2>Audio Format & Sources</h2></div></div><div class="choice-grid">{#each formatOptions as fmt}<button class:active={_fmtBase === fmt.value} on:click={() => setParentFormat(fmt.value)}><strong>{fmt.name}</strong><span>{fmt.label}</span></button>{/each}</div>{#if showBitDepthRow}<div class="segmented"><button class:active={!_fmtBitDepth} on:click={() => setParentFormat(_fmtBase)}>Best</button><button class:active={_fmtBitDepth === '16'} on:click={() => setBitDepth('16')}>16-bit</button><button class:active={_fmtBitDepth === '24'} on:click={() => setBitDepth('24')}>24-bit</button></div>{/if}<div class="panel-heading source-heading"><h3>Sources</h3><span>Auto selects the best available match.</span></div><div class="source-grid">{#each downloadSourceOptions as src}<button class:active={selectedDownloadSources.includes(src.value)} on:click={() => toggleDownloadSource(src.value)}>{#if src.icon}<img src={src.icon} alt="" />{:else}<span class="auto-source">A</span>{/if}<span>{src.label}</span></button>{/each}</div></section>
 
             <section class="settings-section" id="settings-discovery"><div class="settings-heading"><div><p class="eyebrow">Discover</p><h2>Storefront & Genre</h2></div></div><div class="setting-row"><label for="region">Storefront</label><select id="region" bind:value={discoveryRegion} on:change={() => { config.apple_storefront = discoveryRegion; loadDiscoveryGenres(); loadDiscoveryData(); }}><option value="gb">United Kingdom</option><option value="us">United States</option><option value="ca">Canada</option><option value="au">Australia</option><option value="de">Germany</option><option value="fr">France</option><option value="jp">Japan</option><option value="in">India</option></select></div><div class="setting-row"><label for="genre">Genre</label><select id="genre" bind:value={discoveryGenre} on:change={loadDiscoveryData}><option value="">All genres</option>{#each discoveryGenres as genre}<option value={genre.id}>{genre.name}</option>{/each}</select></div></section>
 
-            <section class="settings-section"><div class="settings-heading"><div><p class="eyebrow">Connected library</p><h2>Apple Music</h2></div><span class:connected={!!config.apple_music_user_token} class="connection-badge">{config.apple_music_user_token ? 'Connected' : 'Not connected'}</span></div><div class="privacy-banner"><strong>Local credentials only</strong><span>Tokens are stored in Vela’s local configuration and sent only to Apple’s authenticated endpoints. They are never uploaded to a Vela mirror.</span></div><div class="setting-row"><div><strong>Browser connection</strong><span>Capture a valid Apple Music browser session locally.</span>{#if appleLogin.message}<small class:error-text={appleLogin.phase === 'error'}>{appleLogin.message}</small>{/if}</div><button class="primary" on:click={startAppleLogin}>{config.apple_music_user_token ? 'Reconnect' : 'Connect'}</button></div><details><summary>Manual credentials</summary><label>Authorization token<input type="password" bind:value={config.apple_authorization_token} autocomplete="off" /></label><label>Music User Token<input type="password" bind:value={config.apple_music_user_token} autocomplete="off" /></label><label>Storefront<input bind:value={config.apple_storefront} maxlength="2" /></label></details></section>
+            <section class="settings-section"><div class="settings-heading"><div><p class="eyebrow">Connected library</p><h2>Apple Music</h2></div><span class:connected={!!config.apple_music_user_token} class="connection-badge">{config.apple_music_user_token ? 'Connected' : 'Not connected'}</span></div><div class="privacy-banner"><strong>Local credentials only</strong><span>Tokens are stored in Vela’s local configuration and sent only to Apple’s authenticated endpoints. They are never uploaded to a Vela mirror.</span></div><div class="setting-row"><div><strong>Browser connection</strong><span>Capture a valid Apple Music browser session locally.</span>{#if appleLogin.message}<small class:error-text={appleLogin.phase === 'error'}>{appleLogin.message}</small>{/if}</div><button class="primary" on:click={startAppleLogin}>{config.apple_music_user_token ? 'Reconnect' : 'Connect'}</button></div><details><summary>Manual credentials</summary><label>Authorization token<input type="password" bind:value={config.apple_authorization_token} autocomplete="off" /></label><label>Music User Token<input type="password" bind:value={config.apple_music_user_token} autocomplete="off" /></label><label>Storefront<input bind:value={config.apple_storefront} maxlength="2" /></label></details><div class="index-maintenance"><div><strong>Local library index</strong><span>Check for changes keeps the current cache visible while updating it. Reset is only needed if cached data is wrong or damaged.</span></div><div><button class="secondary" on:click={() => loadAppleMusicLibrary(true)} disabled={appleLibraryLoading}><RefreshCw size={15}/> Check for changes</button><button class="danger-link" on:click={resetAppleIndex}>Reset index</button></div></div></section>
 
             <section class="settings-section"><div class="settings-heading"><div><p class="eyebrow">Automation</p><h2>Apple Playlist Sync</h2></div><label class="switch"><input type="checkbox" bind:checked={config.auto_sync_enabled} /><span></span></label></div><p class="section-note">Runs only while Vela is open. Only Apple Music playlists can be tracked.</p><div class="sync-controls"><label>Hour<input type="number" min="0" max="23" bind:value={config.auto_sync_hour} /></label><label>Minute<input type="number" min="0" max="59" bind:value={config.auto_sync_minute} /></label><button class="secondary" on:click={runAutoSyncNow} disabled={autoSyncRunning}>{autoSyncRunning ? 'Syncing…' : 'Sync Now'}</button></div>{#if autoSyncLastResult}<p class="result-note">{autoSyncLastResult}</p>{/if}</section>
 
@@ -2707,11 +2852,11 @@
       </main>
     </section>
 
-    {#if isDownloading || downloadJobs.some(job => job.status === 'waiting')}
+    {#if (isDownloading || downloadJobs.some(job => job.status === 'waiting' || job.status === 'paused')) && playlistTitle && (playlistTotalTracks > 0 || trackOrder.length > 0)}
       <aside class="queue-panel compact-queue" on:click={() => selectPage('downloads')}>
         <button class="queue-header" on:click={() => selectPage('downloads')}>
           {#if playlistArtwork}<img class="queue-art" src={playlistArtwork} alt="" />{:else}<span class="queue-art placeholder"><Download size={18}/></span>{/if}
-          <div><strong>{queuePaused ? 'Downloads paused' : (playlistTitle || 'Preparing download')}</strong><span>{queueFinishedCount}/{queueTrackKeys.length || '…'} songs · {downloadJobs.filter(job => job.status === 'waiting').length} queued</span></div>
+          <div><strong>{queuePaused ? 'Downloads paused' : (playlistTitle || 'Preparing download')}</strong><span>{queueFinishedCount}/{queueTrackKeys.length || '…'} songs · {downloadJobs.filter(job => job.status === 'waiting' || job.status === 'paused').length} queued</span></div>
         </button>
         <div class="queue-controls"><button aria-label={queuePaused ? 'Resume queue' : 'Pause queue'} on:click={toggleQueuePause}>{#if queuePaused}<Play size={17}/>{:else}<Pause size={17}/>{/if}</button><button aria-label="Cancel queue" on:click|stopPropagation={cancelDownload}><X size={17}/></button></div>
         <div class="queue-overall-progress" style={`--queue-progress:${queueOverallProgress}%`}></div>
@@ -2724,7 +2869,9 @@
     <audio bind:this={audioEl} on:timeupdate={handleAudioTimeUpdate} on:loadedmetadata={handleAudioLoadedMetadata} on:ended={handleAudioEnded}></audio>
   </div>
 
-  {#if showCustomDownload}<div class="modal-backdrop" role="presentation" on:click={() => showCustomDownload = false}><section class="modal-card" role="dialog" aria-modal="true" on:click|stopPropagation><header><div><p class="eyebrow">Downloads</p><h2>Add custom link</h2></div><button aria-label="Close" on:click={() => showCustomDownload = false}><X size={18}/></button></header><label class="field-label" for="custom-links">Track, album, playlist, or artist links</label><textarea id="custom-links" class="custom-links" bind:this={inputUrlEl} bind:value={inputUrl} placeholder="One link per line"></textarea><div class="custom-destination"><div><strong>Destination</strong><span>{customDestination || config.download_path}\Apple Music</span></div><button class="secondary" on:click={chooseCustomDestination}><FolderOpen size={16}/> Choose</button></div><footer class="modal-actions"><button class="icon-button" aria-label="Audio and source settings" on:click={() => { showCustomDownload = false; openSettings('settings-audio'); }}><Settings size={18}/></button><button class="primary" disabled={!inputUrl.trim()} on:click={startCustomDownload}><Download size={16}/> {isDownloading ? 'Add to queue' : 'Download'}</button></footer></section></div>{/if}
+  {#if toastMessage}<div class:warning={toastTone === 'warning'} class:success={toastTone === 'success'} class="app-toast" role="status"><span>{toastMessage}</span><button aria-label="Dismiss notification" on:click={() => toastMessage = ''}><X size={16}/></button></div>{/if}
+  {#if confirmDialog}<div class="modal-backdrop confirm-backdrop" role="presentation" on:click={() => resolveConfirmation(false)}><section class="modal-card confirm-card" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title" on:click|stopPropagation><header><div><p class="eyebrow">Please confirm</p><h2 id="confirm-title">{confirmDialog.title}</h2></div></header><p>{confirmDialog.message}</p><footer class="modal-actions"><button class="secondary" on:click={() => resolveConfirmation(false)}>Keep</button><button class:danger={confirmDialog.danger} class="primary" on:click={() => resolveConfirmation(true)}>{confirmDialog.confirmLabel}</button></footer></section></div>{/if}
+  {#if showCustomDownload}<div class="modal-backdrop" role="presentation" on:click={() => showCustomDownload = false}><section class="modal-card" role="dialog" aria-modal="true" on:click|stopPropagation><header><div><p class="eyebrow">Downloads</p><h2>Add custom link</h2></div><button aria-label="Close" on:click={() => showCustomDownload = false}><X size={18}/></button></header><label class="field-label" for="custom-links">Track, album, playlist, or artist links</label><textarea id="custom-links" class="custom-links" bind:this={inputUrlEl} bind:value={inputUrl} placeholder="One link per line"></textarea><div class="custom-destination"><div><strong>Destination</strong><span>{customDestination || config.download_path}</span></div><button class="secondary" on:click={chooseCustomDestination}><FolderOpen size={16}/> Choose</button></div><footer class="modal-actions"><button class="icon-button" aria-label="Audio and source settings" on:click={() => { showCustomDownload = false; openSettings('settings-audio'); }}><Settings size={18}/></button><button class="primary" disabled={!inputUrl.trim()} on:click={startCustomDownload}><Download size={16}/> {isDownloading ? 'Add to queue' : 'Download'}</button></footer></section></div>{/if}
 
   {#if libraryContextItem}<div class="context-dismiss" on:click={() => libraryContextItem = null} on:contextmenu|preventDefault={() => libraryContextItem = null}></div><div class="context-menu" style={`left:${libraryContextX}px;top:${libraryContextY}px`}><button on:click={() => { if (libraryContextItem) openAppleLibraryDetail(libraryContextItem.url, libraryContextItem.name, libraryContextItem.image_url || ''); libraryContextItem = null; }}><Library size={16}/> View songs</button><button on:click={() => { if (libraryContextItem) downloadPlaylistUrl(libraryContextItem.url); libraryContextItem = null; }}><Download size={16}/> Download</button><button on:click={() => { if (libraryContextItem) toggleLibrarySelection(libraryContextItem.url); libraryContextItem = null; }}><Circle size={16}/> {selectedLibraryItems.has(libraryContextItem.url) ? 'Deselect' : 'Select'}</button></div>{/if}
   {#if showLibraryNavMenu}<div class="context-dismiss" on:click={() => showLibraryNavMenu = false}></div><div class="context-menu" style={`left:${libraryNavMenuX}px;top:${libraryNavMenuY}px`}><button on:click={() => { showLibraryNavMenu = false; loadAppleMusicLibrary(true); }}><RefreshCw size={16}/> Refresh library</button></div>{/if}
@@ -2797,7 +2944,7 @@
   .library-tools{display:flex;align-items:center;gap:9px}.compact-search{flex:1;max-width:440px;padding:0 12px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}.compact-search input{border:0;background:transparent;box-shadow:none}.icon-select{display:flex;align-items:center;gap:7px;padding:0 9px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}.icon-select select{border:0;background:transparent;box-shadow:none}.selection-toolbar{position:sticky;top:-30px;z-index:5;display:flex;align-items:center;gap:9px;margin:14px 0;padding:10px 12px;border:1px solid var(--accent);border-radius:12px;background:var(--surface);box-shadow:var(--shadow)}.selection-toolbar strong{margin-right:auto}.music-card.selectable.selected{padding:5px;margin:-5px;border:2px solid var(--accent);border-radius:17px}.select-release{position:absolute;z-index:3;left:9px;top:9px;width:24px;height:24px;display:grid;place-items:center;border:2px solid rgba(255,255,255,.9);border-radius:50%;background:rgba(0,0,0,.28);color:white;opacity:0;box-shadow:0 1px 5px rgba(0,0,0,.25)}.music-card:hover .select-release,.select-release.selected{opacity:1}.select-release.selected{border-color:var(--accent);background:var(--accent)}.offline-icon{margin-left:auto}
   .custom-links{min-height:130px;margin-top:8px;resize:vertical}.custom-destination{display:flex;align-items:center;justify-content:space-between;gap:18px;margin-top:14px;padding:13px;border:1px solid var(--line);border-radius:12px}.custom-destination>div{display:grid;gap:4px;min-width:0}.custom-destination span{overflow:hidden;text-overflow:ellipsis;color:var(--muted);font-size:11px}.modal-actions{display:flex;justify-content:flex-end;gap:9px}.context-dismiss{position:fixed;inset:0;z-index:79}.context-menu{position:fixed;z-index:80;width:205px;display:grid;gap:3px;padding:6px;border:1px solid var(--line);border-radius:11px;background:var(--surface);box-shadow:var(--shadow)}.context-menu button{display:flex;align-items:center;gap:9px;padding:9px;border-radius:7px;background:transparent;text-align:left}.context-menu button:hover{background:var(--surface-2)}
   .job-status{padding:4px 8px;border-radius:99px;background:var(--surface-2);color:var(--muted);font-size:9px;text-transform:capitalize}.job-status.downloading{background:var(--accent-soft);color:var(--accent)}.history-toolbar>span{color:var(--muted);font-size:11px}
-  .track-state-icon{display:grid;place-items:center;color:var(--muted)}.queue-body article:has(.track-state-icon) {grid-template-columns:18px 1fr auto}.queue-body article:has(.track-state-icon) .track-state-icon:has(svg){width:18px;height:18px}.spin{animation:spin .9s linear infinite}.queue-overall-progress{height:3px;background:linear-gradient(90deg,var(--accent) var(--queue-progress),var(--line) var(--queue-progress));transition:background .2s}.queue-footer>span{color:var(--muted);font-size:10px}.queue-panel{padding-bottom:0}.queue-header>svg{color:var(--muted);flex:0 0 auto}
+  .track-state-icon{display:grid;place-items:center;color:var(--muted)}.queue-body article:has(.track-state-icon) {grid-template-columns:18px 1fr auto}.queue-body article:has(.track-state-icon) .track-state-icon:has(svg){width:18px;height:18px}.rotating-loader{display:inline-grid;flex:0 0 auto;place-items:center;line-height:0;transform-origin:50% 50%;will-change:transform;animation:spin .72s linear infinite!important}.rotating-loader svg{display:block}.queue-overall-progress{height:3px;background:linear-gradient(90deg,var(--accent) var(--queue-progress),var(--line) var(--queue-progress));transition:background .2s}.queue-footer>span{color:var(--muted);font-size:10px}.queue-panel{padding-bottom:0}.queue-header>svg{color:var(--muted);flex:0 0 auto}
   .source-heading{margin-top:22px;padding-top:18px;border-top:1px solid var(--line)}
   .apple-detail-card{height:min(760px,80vh)}
   .apple-detail-summary{display:flex;align-items:center;gap:14px;padding:16px 0;border-bottom:1px solid var(--line)}
@@ -2817,10 +2964,13 @@
   .device-title{display:flex;align-items:center;gap:14px}.device-title h2{margin:0 0 4px}.device-title p{margin:0;color:var(--muted);font-size:12px}.ipod-glyph{width:54px;height:70px;display:grid;place-items:center;border-radius:8px;background:linear-gradient(145deg,#d8d8dc,#8e8e93);color:#fff;font-size:20px;box-shadow:inset 0 0 0 1px rgba(0,0,0,.12)}
   .device-storage{display:grid;gap:8px;margin:20px 0}.device-storage>div{display:flex;justify-content:space-between;color:var(--muted);font-size:11px}.device-storage strong{color:var(--text)}.device-storage progress{width:100%;height:7px;accent-color:var(--accent)}
   .device-grid dl{margin:0}.device-grid dl>div{display:flex;justify-content:space-between;gap:20px;padding:8px 0;border-top:1px solid var(--line);font-size:11px}.device-grid dt{color:var(--muted)}.device-grid dd{margin:0;text-align:right;overflow:hidden;text-overflow:ellipsis}.capability-row{display:flex;flex-wrap:wrap;gap:5px;margin-top:14px}.capability-row span{padding:4px 8px;border-radius:99px;background:var(--surface-2);color:var(--muted);font-size:9px;text-transform:uppercase}
-  .library-label{display:flex;align-items:center;gap:7px;cursor:context-menu}.library-label .offline-icon{margin-left:auto}.library-subnav{display:grid;gap:2px;padding:0 0 8px 16px}.library-subnav button{height:36px!important}.sidebar-index{display:grid;gap:5px;padding:9px 10px;color:var(--muted);font-size:10px}.sidebar-index progress{width:100%;height:3px;accent-color:var(--accent)}
+  .library-label{display:flex;align-items:center;gap:7px;cursor:context-menu}.library-label .offline-icon{margin-left:auto}.library-subnav{display:grid;gap:2px;padding:0 0 8px 16px}.library-subnav button{height:36px!important}.sidebar-index{display:grid;gap:5px;padding:9px 10px;color:var(--muted);font-size:10px}.sidebar-index>span{display:flex;align-items:center;gap:6px;white-space:nowrap}.sidebar-index progress{width:100%;height:3px;accent-color:var(--accent)}
   .library-tools{position:relative}.library-tool-button{width:38px;height:38px;display:grid;place-items:center;border:1px solid var(--line);border-radius:11px;background:var(--surface);color:var(--muted)}.tool-menu{position:relative}.tool-popover{position:absolute;right:0;top:44px;background:var(--surface)!important;color:var(--text)!important}.tool-popover button{color:var(--text)!important}.compact-search{height:38px!important;margin-top:0!important}.selection-toolbar{left:auto;right:auto;max-width:620px;margin:14px auto!important;border-color:var(--line)!important}.select-release svg{display:block;margin:auto}.artist-library-list{display:grid}.artist-library-list>button{display:grid;grid-template-columns:48px 1fr auto;align-items:center;gap:13px;padding:10px;border-bottom:1px solid var(--line);background:transparent;text-align:left}.artist-library-list>button:hover{background:var(--surface-2)}.artist-avatar,.artist-avatar img{width:44px;height:44px;display:grid;place-items:center;border-radius:50%;object-fit:cover;background:var(--surface-2)}.artist-library-list>button>span:nth-child(2){display:grid;gap:3px}.artist-library-list small{color:var(--muted)}
   .download-track-list{max-height:min(42vh,360px);overflow:auto;border-top:1px solid var(--line)}.download-track-list article{display:grid;grid-template-columns:22px 1fr;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--line)}.download-track-list article>div{display:grid;gap:4px}.download-track-list span{color:var(--muted);font-size:10px}.download-track-list progress{width:100%;height:3px;accent-color:var(--accent)}.log-toggle{display:flex;align-items:center;gap:7px;margin:10px 14px;padding:7px 9px;border-radius:8px;background:var(--surface-2);color:var(--muted)}.clean-log{max-height:220px;overflow:auto;margin:0 14px 14px;padding:10px;border-radius:9px;background:var(--bg);font:10px/1.45 ui-monospace,monospace}.clean-log p{margin:3px 0;color:var(--muted)}.clean-log p.error{color:#ff453a}.clean-log p.success{color:#30b056}.job-options{position:relative}.job-options summary{width:34px;height:34px;display:grid;place-items:center;border-radius:9px;list-style:none;cursor:pointer}.job-options summary::-webkit-details-marker{display:none}.job-options>div{position:absolute;right:0;top:38px;z-index:8;width:150px;display:grid;padding:5px;border:1px solid var(--line);border-radius:9px;background:var(--surface);box-shadow:var(--shadow)}.job-options button{padding:8px;border-radius:6px;background:transparent;text-align:left;color:var(--text)}.job-options button:hover{background:var(--surface-2)}
+  .preparation-panel{display:flex;align-items:center;gap:14px;padding:18px 20px}.preparation-panel>svg{flex:0 0 auto;color:var(--accent)}.preparation-panel h2{margin:3px 0;font-size:18px}.preparation-panel span{color:var(--muted);font-size:11px}.location-actions{display:flex;flex-wrap:wrap;justify-content:flex-end;gap:7px}.download-location-row>div:first-child{min-width:0}.download-location-row>div:first-child span{display:block;max-width:460px;overflow:hidden;text-overflow:ellipsis}.settings-section .location-actions button{white-space:nowrap}
   .compact-queue{display:grid;grid-template-columns:1fr auto;padding-bottom:3px!important}.compact-queue .queue-header{min-width:0}.queue-art{width:42px;height:42px;flex:0 0 42px;border-radius:8px;object-fit:cover}.queue-art.placeholder{display:grid;place-items:center;background:var(--surface-2)}.queue-controls{display:flex;align-items:center;padding-right:10px}.queue-controls button{width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:transparent;color:var(--muted)}.queue-controls button:hover{background:var(--surface-2);color:var(--text)}.compact-queue .queue-overall-progress{grid-column:1/-1}
+  .queued-job-actions{display:flex!important;align-items:center;gap:4px!important}.queued-job-actions button{width:30px;height:30px;display:grid;place-items:center;border-radius:50%;background:transparent;color:var(--muted)}.queued-job-actions button:hover:not(:disabled){background:var(--surface-2);color:var(--text)}.queued-job-actions button:disabled{opacity:.28}.index-maintenance{display:grid;gap:13px;margin-top:15px;padding:15px;border:1px solid var(--line);border-radius:13px;background:var(--surface-2)}.index-maintenance>div{display:grid;gap:4px}.index-maintenance>div:last-child{display:flex;justify-content:flex-end;gap:9px}.index-maintenance span,.path-copy span{color:var(--muted);font-size:11px}.path-copy{min-width:0;display:grid;gap:5px}.path-copy span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.browse-location{flex:0 0 auto}.download-location-row{grid-template-columns:minmax(0,1fr) auto!important}
+  .app-toast{position:fixed;z-index:90;right:24px;top:24px;width:min(430px,calc(100vw - 48px));display:flex;align-items:flex-start;gap:12px;padding:14px 15px;border:1px solid rgba(255,69,58,.35);border-radius:13px;background:color-mix(in srgb,var(--surface) 94%,#ff453a 6%);box-shadow:var(--shadow);font-size:12px}.app-toast.warning{border-color:rgba(255,159,10,.4);background:color-mix(in srgb,var(--surface) 94%,#ff9f0a 6%)}.app-toast.success{border-color:rgba(48,209,88,.4)}.app-toast span{flex:1;line-height:1.45}.app-toast button{width:24px;height:24px;display:grid;place-items:center;border-radius:50%;background:var(--surface-2)}.confirm-backdrop{z-index:100}.confirm-card{width:min(430px,100%)}.confirm-card>p{margin:18px 0 4px;color:var(--muted);line-height:1.5}.confirm-card .modal-actions{justify-content:flex-end}.confirm-card .primary.danger{background:#ff453a;color:white}
   .release-header>.history-art{flex:0 0 54px}.release-header>div:not(.history-art){flex:1}
   .add-custom-button{display:inline-flex!important;align-items:center!important;justify-content:center;gap:7px;line-height:1}.add-custom-button svg{display:block;flex:0 0 auto}.add-custom-button span{display:block;line-height:1}
   .topbar>div:first-child{display:grid;grid-template-columns:auto 1fr;align-items:center;column-gap:10px}.topbar>div:first-child>.eyebrow,.topbar>div:first-child>h1{grid-column:2}.topbar-back{grid-row:1/3;grid-column:1;width:34px;height:34px;display:grid;place-items:center;border-radius:50%;background:var(--surface-2)}

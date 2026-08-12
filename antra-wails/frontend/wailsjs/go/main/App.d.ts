@@ -38,6 +38,8 @@ export function GetIPodDevices():Promise<string>;
 
 export function GetSpotifyStatus():Promise<string>;
 
+export function GetSuggestedDownloadLocation(arg1:string):Promise<string>;
+
 export function GetTrackLyrics(arg1:string):Promise<string>;
 
 export function LoginSpotify():Promise<string>;

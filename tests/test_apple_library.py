@@ -6,11 +6,13 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 try:
-    import requests  # noqa: F401
+    import requests
 except ModuleNotFoundError:
     requests_stub = types.ModuleType("requests")
     requests_stub.Session = MagicMock
+    requests_stub.HTTPError = type("HTTPError", (Exception,), {})
     sys.modules["requests"] = requests_stub
+    requests = requests_stub
 
 from antra.core.apple_library import AppleLibraryClient
 
@@ -50,6 +52,45 @@ class AppleLibraryURLTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in items], ["0", "1", "2", "3", "4", "5"])
         self.assertEqual(progress[-1], 6)
         self.assertEqual(progress, sorted(progress))
+
+    def test_non_playlist_resources_are_not_indexed_as_playlists(self):
+        folder = {
+            "id": "p.folder",
+            "type": "library-playlist-folders",
+            "attributes": {"name": "Folder"},
+        }
+        self.assertIsNone(self.client._playlist_summary(folder))
+
+    def test_library_playlist_404_falls_back_to_catalog_global_id(self):
+        playlist_id = "p.8Wx66NrSV9GrB2A"
+        routing = {
+            "name": "Apple playlist",
+            "artwork": None,
+            "global_id": "pl.catalog-id",
+        }
+        self.client._get_playlist_routing = MagicMock(return_value=routing)
+        missing_response = MagicMock(status_code=404)
+        missing = requests.HTTPError("not found")
+        missing.response = missing_response
+        catalog_item = {
+            "id": "song-id",
+            "attributes": {
+                "name": "Song",
+                "artistName": "Artist",
+                "albumName": "Album",
+                "playParams": {"id": "song-id"},
+            },
+        }
+
+        def iter_collection(path, **_kwargs):
+            if path.startswith("/playlists/"):
+                raise missing
+            self.assertEqual(path, "/v1/catalog/gb/playlists/pl.catalog-id/tracks")
+            yield catalog_item
+
+        self.client._iter_collection = iter_collection
+        tracks = self.client.get_library_playlist_tracks(playlist_id, force_refresh=True)
+        self.assertEqual([track.title for track in tracks], ["Song"])
 
     def test_library_index_is_persistent_and_account_scoped(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,13 +133,40 @@ class AppleLibraryURLTests(unittest.TestCase):
         result = self.client.index_entire_library(progress_callback=events.append)
 
         self.assertTrue(result["complete"])
-        self.assertEqual(result["completed"], 102)
-        self.assertEqual(result["total"], 102)
+        self.assertEqual(result["completed"], 203)
+        self.assertEqual(result["total"], 203)
         self.assertTrue(events)
         percentages = [event["percent"] for event in events]
-        self.assertTrue(all(0 <= percent <= 99.9 for percent in percentages))
+        self.assertTrue(all(isinstance(percent, int) and 0 <= percent <= 99 for percent in percentages))
         self.assertEqual(percentages, sorted(percentages))
         self.assertGreater(len(set(percentages)), 3)
+
+    def test_missing_playlist_count_is_resolved_before_progress_is_weighted(self):
+        self.client.get_library = MagicMock(return_value={
+            "saved_songs_count": 0,
+            "albums": [],
+            "playlists": [{
+                "url": "apple-music://library/playlist/large",
+                "name": "Large playlist",
+                "track_count": 0,
+            }],
+        })
+        self.client._get_target_track_count = MagicMock(return_value=250)
+
+        def index_detail(_url, _force_refresh, progress_callback):
+            progress_callback(100, 250)
+            progress_callback(250, 250)
+            return {"tracks": [{}] * 250}
+
+        self.client.get_playlist_detail = MagicMock(side_effect=index_detail)
+        events = []
+        result = self.client.index_entire_library(progress_callback=events.append)
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["total"], 502)
+        self.assertEqual(result["completed"], 502)
+        self.assertEqual(events[0]["percent"], 0)
+        self.assertTrue(all(event["percent"] <= 99 for event in events))
 
 
 if __name__ == "__main__":

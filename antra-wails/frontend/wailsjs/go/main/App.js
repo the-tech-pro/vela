@@ -74,6 +74,10 @@ export function GetSpotifyStatus() {
   return window['go']['main']['App']['GetSpotifyStatus']();
 }
 
+export function GetSuggestedDownloadLocation(arg1) {
+  return window['go']['main']['App']['GetSuggestedDownloadLocation'](arg1);
+}
+
 export function GetTrackLyrics(arg1) {
   return window['go']['main']['App']['GetTrackLyrics'](arg1);
 }

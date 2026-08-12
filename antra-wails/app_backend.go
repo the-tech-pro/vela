@@ -24,6 +24,7 @@ import (
 
 type Config struct {
 	DownloadPath                string        `json:"download_path"`
+	DownloadPathIsLibraryRoot   bool          `json:"download_path_is_library_root,omitempty"`
 	AppleEnabled                bool          `json:"apple_enabled"`
 	AppleAuthorizationToken     string        `json:"apple_authorization_token,omitempty"`
 	AppleMusicUserToken         string        `json:"apple_music_user_token,omitempty"`
@@ -120,6 +121,28 @@ func getHistoryPath() string {
 	return filepath.Join(getAppDataDir(), "history.json")
 }
 
+func defaultVelaMusicPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		home = "."
+	}
+	return filepath.Join(home, "Music", "Vela")
+}
+
+// GetSuggestedDownloadLocation provides explicit, local presets for Settings.
+// The returned folder is the actual library root, not a parent that later gains
+// a hidden product-specific suffix.
+func (a *App) GetSuggestedDownloadLocation(kind string) string {
+	home, err := os.UserHomeDir()
+	if err != nil || strings.TrimSpace(home) == "" {
+		home = "."
+	}
+	if strings.EqualFold(strings.TrimSpace(kind), "downloads") {
+		return filepath.Join(home, "Downloads", "Vela")
+	}
+	return filepath.Join(home, "Music", "Vela")
+}
+
 // GetConfig returns the application configuration
 func (a *App) GetConfig() Config {
 	var cfg Config
@@ -129,9 +152,10 @@ func (a *App) GetConfig() Config {
 		if userProfile == "" {
 			userProfile = os.Getenv("HOME")
 		}
-		cfg.DownloadPath = filepath.Join(userProfile, "Music")
+		cfg.DownloadPath = filepath.Join(userProfile, "Music", "Vela")
+		cfg.DownloadPathIsLibraryRoot = true
 		cfg.MaxRetries = 3
-		cfg.AppleStorefront = "us"
+		cfg.AppleStorefront = "gb"
 		cfg.QobuzAppID = "285473059"
 		cfg.DeezerBFSecret = "g4el58wc0zvf9na1"
 		cfg.TidalAuthMode = "session_json"
@@ -146,6 +170,7 @@ func (a *App) GetConfig() Config {
 		cfg.WhitespaceHandling = "preserve"
 		cfg.FilenameConflictBehavior = "skip"
 		cfg.FetchLyrics = true
+		cfg.SaveCoverArtSidecar = true
 		cfg.DownloadSource = "auto"
 		cfg.DownloadSources = []string{"auto"}
 		return cfg
@@ -154,7 +179,7 @@ func (a *App) GetConfig() Config {
 	data, err := os.ReadFile(cfgPath)
 	if err != nil {
 		wailsRuntime.LogErrorf(a.ctx, "Failed to read config: %v", err)
-		cfg.DownloadPath = "./Music"
+		cfg.DownloadPath = defaultVelaMusicPath()
 		return cfg
 	}
 
@@ -162,18 +187,33 @@ func (a *App) GetConfig() Config {
 	if !bytes.Contains(data, []byte(`"fetch_lyrics"`)) {
 		cfg.FetchLyrics = true
 	}
+	if !bytes.Contains(data, []byte(`"save_cover_art_sidecar"`)) {
+		cfg.SaveCoverArtSidecar = true
+	}
 	if cfg.DownloadPath == "" {
 		userProfile := os.Getenv("USERPROFILE")
 		if userProfile == "" {
 			userProfile = os.Getenv("HOME")
 		}
-		cfg.DownloadPath = filepath.Join(userProfile, "Music")
+		cfg.DownloadPath = filepath.Join(userProfile, "Music", "Vela")
+	}
+	if !bytes.Contains(data, []byte(`"download_path_is_library_root"`)) {
+		// Older builds stored a parent and silently appended "Apple Music" in
+		// Python. Preserve an existing legacy library; otherwise migrate the
+		// parent to the new Vela-named root without moving user files.
+		legacy := filepath.Join(cfg.DownloadPath, "Apple Music")
+		if info, err := os.Stat(legacy); err == nil && info.IsDir() {
+			cfg.DownloadPath = legacy
+		} else if !strings.EqualFold(filepath.Base(cfg.DownloadPath), "Vela") && !strings.EqualFold(filepath.Base(cfg.DownloadPath), "Apple Music") {
+			cfg.DownloadPath = filepath.Join(cfg.DownloadPath, "Vela")
+		}
+		cfg.DownloadPathIsLibraryRoot = true
 	}
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 3
 	}
 	if cfg.AppleStorefront == "" {
-		cfg.AppleStorefront = "us"
+		cfg.AppleStorefront = "gb"
 	}
 	if cfg.QobuzAppID == "" {
 		cfg.QobuzAppID = "285473059"
@@ -226,11 +266,12 @@ func (a *App) GetConfig() Config {
 // SaveConfig saves the configuration and marks first run as complete
 func (a *App) SaveConfig(cfg Config) error {
 	cfg.FirstRunComplete = true
+	cfg.DownloadPathIsLibraryRoot = true
 	if cfg.MaxRetries <= 0 {
 		cfg.MaxRetries = 3
 	}
 	if cfg.AppleStorefront == "" {
-		cfg.AppleStorefront = "us"
+		cfg.AppleStorefront = "gb"
 	}
 	if cfg.QobuzAppID == "" {
 		cfg.QobuzAppID = "285473059"
@@ -349,6 +390,7 @@ func (a *App) PickDirectory() string {
 func (a *App) CancelDownload() {
 	a.mu.Lock()
 	a.isStopping = true
+	a.downloadStopReason = "cancelled"
 	a.mu.Unlock()
 
 	cancel, cmd := a.detachActiveDownload()
@@ -398,7 +440,28 @@ func (a *App) writeDownloadControl(paused bool, workers int) error {
 
 func (a *App) PauseDownload() error {
 	cfg := a.GetConfig()
-	return a.writeDownloadControl(true, cfg.MaxConcurrentJobs)
+	if err := a.writeDownloadControl(true, cfg.MaxConcurrentJobs); err != nil {
+		return err
+	}
+
+	// Stop the process tree instead of waiting for every in-flight provider
+	// request to finish. Completed files remain in the library and are skipped
+	// when the checkpointed job resumes; provider-owned partials are retained
+	// when that provider supports resuming them.
+	a.mu.Lock()
+	a.isStopping = true
+	a.downloadStopReason = "paused"
+	a.mu.Unlock()
+	cancel, cmd := a.detachActiveDownload()
+	if cmd != nil {
+		if err := killCommandTree(cmd); err != nil {
+			wailsRuntime.LogWarningf(a.ctx, "Failed to pause library engine immediately: %v", err)
+		}
+	}
+	if cancel != nil {
+		cancel()
+	}
+	return nil
 }
 
 func (a *App) ResumeDownload() error {
@@ -417,6 +480,24 @@ func (a *App) SetDownloadWorkerCount(workers int) error {
 func (a *App) StartDownload(playlists []string) error {
 	wailsRuntime.LogInfof(a.ctx, "Starting download for: %v", playlists)
 
+	// Library indexing is intentionally lower priority than an explicit user
+	// download. Running both Python engines at once can exhaust network sockets,
+	// provider rate limits, and disk bandwidth, making the whole backend appear
+	// frozen. Checkpoint the index and resume it after the download exits.
+	a.mu.Lock()
+	indexCmd := a.indexCmd
+	if indexCmd != nil {
+		a.indexCmd = nil
+		a.indexRestartAfterDownload = true
+	}
+	a.mu.Unlock()
+	if indexCmd != nil {
+		_ = killCommandTree(indexCmd)
+		wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
+			"type": "apple_index_paused", "label": "Index paused while downloading",
+		})
+	}
+
 	if cancel, cmd := a.detachActiveDownload(); cancel != nil || cmd != nil {
 		if cancel != nil {
 			cancel()
@@ -429,6 +510,7 @@ func (a *App) StartDownload(playlists []string) error {
 	a.mu.Lock()
 	a.isStopping = false
 	a.downloadPaused = false
+	a.downloadStopReason = ""
 	a.mu.Unlock()
 	_ = a.writeDownloadControl(false, a.GetConfig().MaxConcurrentJobs)
 
@@ -438,10 +520,31 @@ func (a *App) StartDownload(playlists []string) error {
 	if err != nil {
 		cancel()
 		wailsRuntime.LogErrorf(a.ctx, err.Error())
+		a.resumeDeferredAppleIndex()
 		return err
 	}
 
-	return a.startBackendProcess(ctx, cancel, command, args, workDir, env)
+	if err := a.startBackendProcess(ctx, cancel, command, args, workDir, env); err != nil {
+		a.resumeDeferredAppleIndex()
+		return err
+	}
+	return nil
+}
+
+func (a *App) resumeDeferredAppleIndex() {
+	a.mu.Lock()
+	restart := a.indexRestartAfterDownload
+	a.indexRestartAfterDownload = false
+	a.mu.Unlock()
+	if restart {
+		go func() {
+			if err := a.StartAppleMusicIndex(); err != nil {
+				wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
+					"type": "apple_index_error", "message": fmt.Sprintf("Could not resume library indexing: %v", err),
+				})
+			}
+		}()
+	}
 }
 
 func (a *App) RetryTrackDownload(trackJSON string) error {
@@ -563,8 +666,23 @@ func (a *App) startBackendProcess(
 		a.clearActiveDownload(cmd)
 
 		status := "completed"
+		a.mu.Lock()
+		stopReason := a.downloadStopReason
+		if stopReason != "" {
+			a.downloadStopReason = ""
+		}
+		a.isStopping = false
+		restartIndex := a.indexRestartAfterDownload
+		if restartIndex {
+			a.indexRestartAfterDownload = false
+		}
+		a.mu.Unlock()
 		if ctx.Err() == context.Canceled {
-			status = "cancelled"
+			if stopReason == "paused" {
+				status = "paused"
+			} else {
+				status = "cancelled"
+			}
 		} else if scanErr != nil || err != nil {
 			status = "failed"
 		}
@@ -587,6 +705,16 @@ func (a *App) startBackendProcess(
 			"type":   "process_ended",
 			"status": status,
 		})
+		if restartIndex {
+			go func() {
+				time.Sleep(350 * time.Millisecond)
+				if startErr := a.StartAppleMusicIndex(); startErr != nil {
+					wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
+						"type": "apple_index_error", "message": fmt.Sprintf("Could not resume library indexing: %v", startErr),
+					})
+				}
+			}()
+		}
 	}()
 
 	return nil
@@ -1110,22 +1238,45 @@ func (a *App) StartAppleMusicIndex() error {
 	a.mu.Lock()
 	a.indexCmd = cmd
 	a.mu.Unlock()
+	wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
+		"type": "apple_index_progress", "completed": 0, "total": 1,
+		"percent": 0, "release_completed": 0, "release_total": 0,
+		"label": "Reading local library index",
+	})
 
 	go func() {
 		scanner := bufio.NewScanner(stdout)
 		scanner.Buffer(make([]byte, 64*1024), 32*1024*1024)
+		terminalSeen := false
 		for scanner.Scan() {
 			var payload map[string]interface{}
 			if json.Unmarshal([]byte(scanner.Text()), &payload) == nil {
+				if eventType, _ := payload["type"].(string); eventType == "apple_index_complete" || eventType == "apple_index_incomplete" || eventType == "error" {
+					terminalSeen = true
+				}
 				wailsRuntime.EventsEmit(a.ctx, "apple-index-event", payload)
 			}
 		}
-		_ = cmd.Wait()
+		scanErr := scanner.Err()
+		waitErr := cmd.Wait()
 		a.mu.Lock()
-		if a.indexCmd == cmd {
+		wasCurrent := a.indexCmd == cmd
+		if wasCurrent {
 			a.indexCmd = nil
 		}
 		a.mu.Unlock()
+		if wasCurrent && !terminalSeen {
+			message := "The library index stopped before completion. It will resume from cached releases."
+			if scanErr != nil {
+				message = fmt.Sprintf("Library indexing output failed: %v", scanErr)
+			} else if waitErr != nil {
+				message = fmt.Sprintf("Library indexing stopped: %v", waitErr)
+			}
+			wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
+				"type": "apple_index_incomplete",
+				"data": map[string]interface{}{"completed": 0, "total": 1, "percent": 0, "errors": []interface{}{message}},
+			})
+		}
 	}()
 	return nil
 }

@@ -280,7 +280,7 @@ Every asynchronous surface needs:
 
 ### 6.1 Link download
 
-Downloads is the activity surface. Its Add custom action opens a compact link-and-destination overlay. Once metadata arrives, each requested song, album, or playlist is represented as a job. Source and format choices remain secondary settings. Cancellation remains available throughout active work.
+Downloads is the activity surface. Its Add custom action opens a compact link-and-destination overlay. While metadata is being read, Downloads shows a labeled preparation card. The floating controller appears only after stable job title, artwork/track metadata, and count information are available. Once metadata arrives, each requested song, album, or playlist is represented as a job. Source and format choices remain secondary settings. Cancellation remains available throughout active work.
 
 ### 6.2 Failed downloads
 
@@ -337,6 +337,7 @@ The player preserves title, artist, release context, playback controls, seek, ti
 - Modal/toast entry: 180–240ms.
 - Use opacity and small transforms; avoid large travel.
 - Progress animation may repeat only while work is active.
+- Functional circular loading indicators rotate continuously while their work is active; they must not appear as a stationary partial ring. Reduced-motion treatment may substitute a non-rotating labeled indicator, but must still communicate activity.
 - Disable decorative motion under `prefers-reduced-motion: reduce`.
 
 ## 10. Implementation rules for the overhaul
@@ -422,14 +423,31 @@ These are baseline observations, not authorization for an unbounded redesign. Ea
 - A full-index progress indicator disappears only after every current release
   has a successful local checkpoint. Matching completed indexes stay quiet on
   later launches; incomplete indexes keep an explicit remaining-work state.
-- Index percentage represents completed release checkpoints plus completed
-  songs and may use one decimal place near completion. It must advance as
-  large playlist pages finish rather than parking at a synthetic 99%.
-- The standalone Playlists grid omits the redundant workspace title bar. A
-  playlist detail page retains its title/back navigation header.
+- Index percentage is a whole number based on real saved-song and per-release
+  `meta.total` counts. It represents completed release checkpoints plus every
+  completed song occurrence, including the song-by-song artist lookup pass,
+  then validation.
+  It must advance as large playlist pages finish and reserve 100% for validated
+  completion.
+- The standalone Playlists grid keeps the workspace title bar. The dedicated
+  Favourites page omits that bar because its artwork hero carries the title.
+  A navigated playlist detail page retains back navigation.
+- Download location is one compact row: the current full path truncates safely
+  and a single Browse button opens the native folder picker. Vela defaults to
+  Music\Vela and never displays or appends an invisible folder suffix.
 - Downloaded releases use the same full-panel hero and track-list hierarchy as
   connected-library releases. Do not split the page into simultaneous grid and
   detail columns.
 - Long track lists avoid per-row backdrop filters and use off-screen rendering
   containment. Popovers close when pointer input moves outside their menu or
   trigger.
+- Index status pairs a rotating Lucide loader with a whole percentage and a
+  thin determinate bar. Failures use a themed top-right toast; destructive
+  confirmations use the same blurred modal surface as the rest of Vela and
+  never use browser-native confirm dialogs.
+- Animated Lucide loaders rotate through a dedicated wrapper element rather
+  than transforming the component SVG directly, ensuring motion survives
+  Svelte style scoping and WebView2 SVG transform differences.
+- Queued-job actions are compact icon buttons for move up, run now, and remove.
+  The text row distinguishes Waiting from Paused without adding a second queue
+  surface.

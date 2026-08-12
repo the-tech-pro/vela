@@ -173,7 +173,7 @@ Current non-P2P adapter code includes TIDAL, Qobuz, Apple Music, Amazon Music, D
 | LIB-007 | Scan the local library and expose downloaded albums and playlists through a browsable view. | Implemented |
 | LIB-008 | Save session history with timestamp, source URL, artwork, totals, downloaded/failed/skipped counts, and source breakdown. | Implemented |
 | LIB-009 | Allow history to be cleared explicitly. | Implemented |
-| LIB-010 | Store desktop downloads beneath `<selected parent>/Apple Music`, with album and playlist context folders. Materialize a recording in every requested context by hard-linking when possible and copying otherwise. | Implemented |
+| LIB-010 | Store new desktop downloads in an explicit library root, defaulting to the user's `Music/Vela` folder, with album and playlist context folders. Offer `Music/Vela`, `Downloads/Vela`, and custom-root choices. Preserve an existing legacy `Apple Music` root without moving user files. Materialize a recording in every requested context by hard-linking when possible and copying otherwise. | Implemented |
 | LIB-011 | Treat Apple Music as the authoritative connected library and describe local-file state as Downloaded, not Added to library. | Implemented |
 
 ### 5.7 Download session controls
@@ -498,14 +498,20 @@ rewrite an attached device.
 | LIB-INDEX-006 | Checkpoint completed Apple release details in the local backend index without streaming bulk track payloads through the UI event channel; preload summary artwork separately. | Implemented |
 | LIB-INDEX-007 | Run Apple and Downloaded indexing asynchronously and stage their startup work so navigation remains interactive. Both indexes expose bounded, determinate progress events and return cached content immediately. | Implemented |
 | LIB-INDEX-008 | Treat an Apple index as complete only when every current album and playlist detail is checkpointed successfully. Keep incomplete progress visible, retry transient failures, skip the progress surface on later launches after a matching complete index, and provide a confirmed Reset index action that preserves credentials and downloaded files. | Implemented |
-| LIB-INDEX-009 | Calculate full-library progress from the total track workload across every album and playlist, not merely the number of release requests. Reserve 100% exclusively for the explicit successful completion event. | Implemented |
-| LIB-INDEX-010 | Count every album/playlist checkpoint and every track as index work, and advance progress as track pages finish so a large final release cannot leave the indicator parked at 99%. | Implemented |
+| LIB-INDEX-009 | Calculate full-library progress from real Apple `meta.total` counts for saved songs and every album/playlist, not summary estimates or merely the number of release requests. Reserve 100% exclusively for explicit successful validation. | Implemented |
+| LIB-INDEX-010 | Count every release checkpoint and every song occurrence as index work, use whole percentages, and advance as track pages finish. Count the derived artist-index pass and each artist-detail cache write explicitly, then include final cache validation so progress cannot hide a long save behind a synthetic 99%. | Implemented |
+| LIB-INDEX-011 | After a complete index, return release details and derived artist lookups with the cache-first library snapshot so album, playlist, Favourites, and artist pages open without a per-page backend fetch. Keep the last complete snapshot visible during later background summary reconciliation. | Implemented |
 | QUEUE-001 | Treat every song, album, playlist, or custom link request as a persistent job. Adding a request must never replace or cancel the active job. | Implemented |
 | QUEUE-002 | Restore waiting work after restart. Completed files are validated/reused and incomplete work resumes without duplicating valid output. | Implemented |
-| QUEUE-003 | Pause/resume prevents new tracks from starting without cancelling in-flight tracks. Queue cancellation requires confirmation. | Implemented |
+| QUEUE-003 | Pause stops the active backend process tree promptly, preserves completed songs, checkpoints the job as paused, and retries or resumes a provider-owned partial where supported. Queue cancellation requires themed confirmation. | Implemented |
 | QUEUE-004 | Apply worker-limit changes live from 1–8. Increasing starts additional work when available; decreasing lets in-flight tracks finish and gates subsequent starts. | Implemented |
 | QUEUE-005 | The floating download controller remains compact, shows current artwork and overall progress, offers pause/resume/cancel, opens Downloads when clicked, and disappears when no active/waiting job remains. | Implemented |
 | QUEUE-006 | Downloads contains the current song list (bounded-height scrolling), waiting job queue, clean expandable log, and completed job history with functioning action menus. | Implemented |
+| QUEUE-007 | Waiting and paused jobs can be reordered, promoted to run immediately (checkpointing the former active job), or removed individually with confirmation. Queue state changes render before backend preparation begins. | Implemented |
+| LIB-INDEX-012 | Downloaded indexing weights metadata work by every detected song rather than every folder, emits explicit warning/error events, and never reports completion when the index cache could not be written. | Implemented |
+| LIB-INDEX-013 | Apple indexing yields resource priority to explicit downloads and resumes from its local checkpoints afterwards so background work cannot starve the download backend. | Implemented |
+| ART-001 | Artwork extraction cache identities include the complete normalized path plus file size and modification time; releases in the same parent folder must never collide. Embedded artwork and a cover sidecar are enabled by default. | Implemented |
+| LIB-INDEX-014 | Ignore playlist-folder resources returned alongside playlists. If an Apple-managed library playlist returns 404 for its library tracks relationship, resolve its `playParams.globalId` and retry through the documented storefront catalog tracks relationship without exposing the failed route as a job error. | Implemented |
 | NAMING-001 | Default album track names use the track number only (`12 - Title`). Disc prefixes are opt-in so normal metadata cannot produce confusing names such as `1-12 - Title`. | Implemented |
 
 ## 15. Library information architecture
@@ -519,8 +525,9 @@ Refresh library; it does not refresh immediately.
 - Recently Added presents locally indexed albums and playlists.
 - Albums and Playlists use consistent selectable grid cards and shared search,
   sort, filter, selection, download, and context-menu behaviour.
-- The standalone Playlists grid omits the redundant top title bar; an opened
-  playlist keeps the normal detail header and back navigation.
+- The standalone Playlists grid keeps the normal workspace title bar. The
+  dedicated Favourites destination omits it because its artwork-led hero is the
+  page title; opened playlists retain normal detail back navigation.
 - Favourites opens Apple Music's actual automatic Favourite Songs playlist,
   using its Apple-provided URL, artwork, track count, and a red star identity.
 - Artists lists library artists alphabetically with artwork when available and

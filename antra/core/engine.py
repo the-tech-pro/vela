@@ -91,7 +91,7 @@ class EngineConfig:
     retry_delay: float = 5.0
     fetch_lyrics: bool = True
     fetch_artwork: bool = True
-    save_cover_art_sidecar: bool = False
+    save_cover_art_sidecar: bool = True
     output_format: str = "source"
     strict_matching: bool = False
     max_workers: int = 1

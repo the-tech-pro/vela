@@ -15,19 +15,21 @@ import (
 
 // App struct
 type App struct {
-	ctx              context.Context
-	mu               sync.Mutex
-	cancelDownload   context.CancelFunc
-	activeCmd        *exec.Cmd
-	indexCmd         *exec.Cmd
-	isStopping       bool
-	downloadPaused   bool
-	downloadIndexing bool
-	ffmpegExe        string // absolute path to bundled ffmpeg for local playback helpers
-	ffprobeExe       string // absolute path to bundled ffprobe for local library metadata
-	mediaServer      *http.Server
-	mediaBaseURL     string
-	mediaToken       string
+	ctx                       context.Context
+	mu                        sync.Mutex
+	cancelDownload            context.CancelFunc
+	activeCmd                 *exec.Cmd
+	indexCmd                  *exec.Cmd
+	isStopping                bool
+	downloadPaused            bool
+	downloadStopReason        string
+	downloadIndexing          bool
+	indexRestartAfterDownload bool
+	ffmpegExe                 string // absolute path to bundled ffmpeg for local playback helpers
+	ffprobeExe                string // absolute path to bundled ffprobe for local library metadata
+	mediaServer               *http.Server
+	mediaBaseURL              string
+	mediaToken                string
 }
 
 // NewApp creates a new App application struct

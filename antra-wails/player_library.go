@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -83,13 +84,15 @@ func readDownloadedLibraryCache() downloadedLibraryCache {
 	return cache
 }
 
-func writeDownloadedLibraryCache(cache downloadedLibraryCache) {
+func writeDownloadedLibraryCache(cache downloadedLibraryCache) error {
 	data, err := json.Marshal(cache)
 	if err != nil {
-		return
+		return err
 	}
-	_ = os.MkdirAll(getAppDataDir(), 0755)
-	_ = os.WriteFile(downloadedLibraryCachePath(), data, 0644)
+	if err := os.MkdirAll(getAppDataDir(), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(downloadedLibraryCachePath(), data, 0644)
 }
 
 var (
@@ -192,28 +195,80 @@ func (a *App) refreshDownloadedLibraryIndex(root string, cfg Config) {
 		return
 	}
 	a.downloadIndexing = true
+	indexCmd := a.indexCmd
+	if indexCmd != nil {
+		a.indexCmd = nil
+	}
 	a.mu.Unlock()
-	wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{"type": "progress", "percent": 1, "label": "Finding downloads"})
-	result := a.rebuildDownloadedLibraryIndex(root, cfg, func(percent int, label string) {
+	if indexCmd != nil {
+		_ = killCommandTree(indexCmd)
+		wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
+			"type": "apple_index_paused", "label": "Index paused while checking downloads",
+		})
+	}
+	defer func() {
+		a.mu.Lock()
+		a.downloadIndexing = false
+		a.mu.Unlock()
+		if recovered := recover(); recovered != nil {
+			wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{
+				"type": "error", "message": fmt.Sprintf("Downloaded music indexing failed: %v", recovered),
+			})
+		}
+		if indexCmd != nil {
+			a.mu.Lock()
+			downloadActive := a.activeCmd != nil
+			if downloadActive {
+				a.indexRestartAfterDownload = true
+			}
+			a.mu.Unlock()
+			if !downloadActive {
+				go func() {
+					if err := a.StartAppleMusicIndex(); err != nil {
+						wailsRuntime.EventsEmit(a.ctx, "apple-index-event", map[string]interface{}{
+							"type": "apple_index_error", "message": fmt.Sprintf("Could not resume library indexing: %v", err),
+						})
+					}
+				}()
+			}
+		}
+	}()
+	wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{"type": "progress", "percent": 0, "label": "Finding downloads"})
+	library, indexErrors, err := a.rebuildDownloadedLibraryIndex(root, cfg, func(percent int, label string) {
 		wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{"type": "progress", "percent": percent, "label": label})
 	})
-	var library libraryPayload
-	_ = json.Unmarshal([]byte(result), &library)
-	a.mu.Lock()
-	a.downloadIndexing = false
-	a.mu.Unlock()
+	if err != nil {
+		wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{"type": "error", "message": err.Error()})
+		return
+	}
+	if len(indexErrors) > 0 {
+		wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{
+			"type": "warning", "message": fmt.Sprintf("%d downloaded release(s) could not be indexed", len(indexErrors)), "errors": indexErrors,
+		})
+	}
 	wailsRuntime.EventsEmit(a.ctx, "downloaded-index-event", map[string]interface{}{"type": "complete", "percent": 100, "library": library})
 }
 
-func (a *App) rebuildDownloadedLibraryIndex(root string, cfg Config, progress func(int, string)) string {
+func (a *App) rebuildDownloadedLibraryIndex(root string, cfg Config, progress func(int, string)) (libraryPayload, []string, error) {
+	if info, err := os.Stat(root); err != nil || !info.IsDir() {
+		if err == nil {
+			err = fmt.Errorf("download path is not a folder")
+		}
+		return libraryPayload{}, nil, fmt.Errorf("could not index downloaded music: %w", err)
+	}
 	albumStructure := cfg.AlbumFolderStructure
 	if albumStructure == "" {
 		albumStructure = cfg.FolderStructure
 	}
-	payload := libraryPayload{
-		Albums:    a.scanReleaseSummaries(root, "album", albumStructure),
-		Playlists: a.scanReleaseSummaries(root, "playlist", cfg.PlaylistFolderStructure),
+	if progress != nil {
+		progress(2, "Finding downloaded albums")
 	}
+	albums := a.scanReleaseSummaries(root, "album", albumStructure)
+	if progress != nil {
+		progress(6, "Finding downloaded playlists")
+	}
+	playlists := a.scanReleaseSummaries(root, "playlist", cfg.PlaylistFolderStructure)
+	payload := libraryPayload{Albums: albums, Playlists: playlists}
 	if progress != nil {
 		progress(10, "Reading cached metadata")
 	}
@@ -221,41 +276,59 @@ func (a *App) rebuildDownloadedLibraryIndex(root string, cfg Config, progress fu
 	cache.Root = root
 	cache.Payload = payload
 	allReleases := append(append([]libraryReleaseSummary{}, payload.Albums...), payload.Playlists...)
+	totalUnits := 1
+	for _, release := range allReleases {
+		totalUnits += 1 + max(1, release.TrackCount)
+	}
+	completedUnits := 0
 	lastPercent := 10
+	indexErrors := make([]string, 0)
+	reportUnit := func(label string) {
+		if completedUnits >= totalUnits-1 {
+			return
+		}
+		completedUnits++
+		percent := 10 + (completedUnits * 89 / totalUnits)
+		if progress != nil && percent != lastPercent {
+			progress(percent, label)
+			lastPercent = percent
+		}
+	}
 	for index, release := range allReleases {
 		cacheKey := filepath.ToSlash(release.RelativePath)
 		cached, ok := cache.Details[cacheKey]
 		if !ok || cached.TrackCount != release.TrackCount {
-			if detail, err := a.buildDownloadedReleaseDetail(root, release); err == nil {
+			detail, detailErr := a.buildDownloadedReleaseDetail(root, release, func() { reportUnit(release.Title) })
+			if detailErr == nil {
 				cache.Details[cacheKey] = detail
+			} else {
+				indexErrors = append(indexErrors, fmt.Sprintf("%s: %v", release.Title, detailErr))
+				for skipped := 0; skipped < max(1, release.TrackCount); skipped++ {
+					reportUnit(release.Title)
+				}
+			}
+		} else {
+			for indexed := 0; indexed < max(1, release.TrackCount); indexed++ {
+				reportUnit(release.Title)
 			}
 		}
+		reportUnit(release.Title)
 		if (index+1)%5 == 0 {
-			writeDownloadedLibraryCache(cache)
-		}
-		percent := 95
-		if len(allReleases) > 0 {
-			percent = 10 + ((index + 1) * 85 / len(allReleases))
-		}
-		if progress != nil && percent != lastPercent {
-			progress(percent, release.Title)
-			lastPercent = percent
+			_ = writeDownloadedLibraryCache(cache)
 		}
 	}
 	if progress != nil {
 		progress(99, "Saving download index")
 	}
 	cache.IndexedAt = time.Now().Unix()
-	writeDownloadedLibraryCache(cache)
-
-	data, err := json.Marshal(payload)
-	if err != nil {
-		return `{"albums":[],"playlists":[],"error":"Failed to encode library"}`
+	if err := writeDownloadedLibraryCache(cache); err != nil {
+		return libraryPayload{}, indexErrors, fmt.Errorf("could not save downloaded music index: %w", err)
 	}
-	return string(data)
+
+	return payload, indexErrors, nil
 }
 
-func (a *App) buildDownloadedReleaseDetail(root string, summary libraryReleaseSummary) (libraryReleaseDetail, error) {
+func (a *App) buildDownloadedReleaseDetail(root string, summary libraryReleaseSummary, trackIndexed func()) (libraryReleaseDetail, error) {
 	absolutePath, err := resolveLibraryPath(root, summary.RelativePath)
 	if err != nil {
 		return libraryReleaseDetail{}, err
@@ -272,6 +345,9 @@ func (a *App) buildDownloadedReleaseDetail(root string, summary libraryReleaseSu
 		applyTrackFallbackMetadata(&track)
 		applyTrackProbeMetadata(&track, a.ffprobeExe)
 		tracks = append(tracks, track)
+		if trackIndexed != nil {
+			trackIndexed()
+		}
 	}
 	detail := libraryReleaseDetail{Kind: summary.Kind, RelativePath: filepath.ToSlash(summary.RelativePath), Title: summary.Title, Artist: summary.Artist, Year: summary.Year, TrackCount: len(tracks), Tracks: tracks}
 	detail.ArtworkURL = a.artworkURLForRelease(absolutePath, trackPaths)
@@ -344,7 +420,7 @@ func (a *App) GetDownloadedRelease(relativePath string) string {
 	cache.Root = root
 	cache.Details[cacheKey] = detail
 	cache.IndexedAt = time.Now().Unix()
-	writeDownloadedLibraryCache(cache)
+	_ = writeDownloadedLibraryCache(cache)
 
 	data, err := json.Marshal(detail)
 	if err != nil {
@@ -882,11 +958,7 @@ func (a *App) extractEmbeddedArtwork(audioPath string) (string, error) {
 		return "", err
 	}
 
-	sum := hex.EncodeToString([]byte(strings.ToLower(audioPath)))
-	if len(sum) > 48 {
-		sum = sum[:48]
-	}
-	outputPath := filepath.Join(cacheDir, sum+".png")
+	outputPath := filepath.Join(cacheDir, embeddedArtworkCacheKey(audioPath)+".png")
 	if info, err := os.Stat(outputPath); err == nil && !info.IsDir() && info.Size() > 0 {
 		return outputPath, nil
 	}
@@ -906,6 +978,15 @@ func (a *App) extractEmbeddedArtwork(audioPath string) (string, error) {
 		return "", fmt.Errorf("ffmpeg artwork extract: %w (%s)", err, strings.TrimSpace(string(out)))
 	}
 	return outputPath, nil
+}
+
+func embeddedArtworkCacheKey(audioPath string) string {
+	identity := strings.ToLower(filepath.Clean(audioPath))
+	if info, err := os.Stat(audioPath); err == nil {
+		identity = fmt.Sprintf("%s|%d|%d", identity, info.Size(), info.ModTime().UnixNano())
+	}
+	sum := sha256.Sum256([]byte(identity))
+	return hex.EncodeToString(sum[:])
 }
 
 func (a *App) mediaURL(kind, absolutePath string) string {

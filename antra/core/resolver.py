@@ -156,16 +156,48 @@ class SourceResolver:
         result: SearchResult,
         actual_bit_depth: Optional[int] = None,
     ) -> None:
-        return
+        key = self._album_source_key(track)
+        if not key or not adapter_name:
+            return
+        depth = actual_bit_depth or result.bit_depth or 0
+        with self._album_source_lock:
+            wins = self._album_source_wins.setdefault(key, {})
+            wins[adapter_name] = wins.get(adapter_name, 0) + 1
+            if depth:
+                depths = self._album_source_bit_depths.setdefault(key, {})
+                depths[adapter_name] = max(depths.get(adapter_name, 0), int(depth))
 
     def record_album_source_failure(self, track: TrackMetadata, adapter_name: str) -> None:
-        return
+        key = self._album_source_key(track)
+        if not key or not adapter_name:
+            return
+        with self._album_source_lock:
+            wins = self._album_source_wins.get(key)
+            if not wins or adapter_name not in wins:
+                return
+            wins[adapter_name] -= 1
+            if wins[adapter_name] <= 0:
+                wins.pop(adapter_name, None)
+                self._album_source_bit_depths.get(key, {}).pop(adapter_name, None)
 
     def _preferred_album_adapter_name(self, track: TrackMetadata, excluded: set[str]) -> Optional[str]:
-        return None
+        key = self._album_source_key(track)
+        if not key:
+            return None
+        available = {adapter.name for adapter in self.adapters}
+        with self._album_source_lock:
+            candidates = {
+                name: wins for name, wins in self._album_source_wins.get(key, {}).items()
+                if wins > 0 and name in available and name not in excluded and not self._is_rate_limited(name)
+            }
+        return max(candidates, key=lambda name: (candidates[name], name)) if candidates else None
 
     def _album_adapter_proven_hires(self, track: TrackMetadata, adapter_name: str) -> bool:
-        return False
+        key = self._album_source_key(track)
+        if not key:
+            return False
+        with self._album_source_lock:
+            return self._album_source_bit_depths.get(key, {}).get(adapter_name, 0) >= 24
 
     def _rank_by_stats(self, adapters: list[BaseSourceAdapter]) -> list[BaseSourceAdapter]:
         """Reorder a single tier by persistent reliability, preserving input order

@@ -1178,7 +1178,11 @@ class AntraService:
                 tracks = spotify.batch_enrich_album_data(tracks)
                 tracks = self._preserve_track_identity(original_tracks, tracks)
             elif "music.apple.com" in playlist or is_apple_library_url(playlist):
-                tracks = self._enrich_apple_tracks_with_spotify_metadata(tracks, cfg)
+                # Apple library/catalog metadata already carries stable IDs,
+                # ISRC, artwork, duration, and release fields. A second Spotify
+                # batch lookup delays startup and adds no data required by the
+                # resolver, so keep this path entirely Apple-local.
+                return self._stamp_disc_totals(tracks)
             elif not (
                 "soundcloud.com" in playlist
                 or "music.youtube.com" in playlist
@@ -1794,7 +1798,7 @@ class AntraService:
             max_retries=cfg.max_retries,
             retry_delay=cfg.retry_delay,
             fetch_lyrics=cfg.fetch_lyrics,
-            save_cover_art_sidecar=getattr(cfg, "save_cover_art_sidecar", False),
+            save_cover_art_sidecar=getattr(cfg, "save_cover_art_sidecar", True),
             output_format=cfg.output_format,
             strict_matching=getattr(cfg, "strict_matching", False),
             # Paid desktop builds set two workers. The environment override is

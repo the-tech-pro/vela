@@ -142,7 +142,7 @@ class Config:
     enrich_album_data: bool = True
     source_preference: str = "auto"
     output_format: str = "flac"
-    save_cover_art_sidecar: bool = False
+    save_cover_art_sidecar: bool = True
 
     # Comma-separated list of enabled non-P2P adapter groups.
     # Empty = all enabled. Controlled via the Sources toggle in Settings.
@@ -318,7 +318,7 @@ def load_config() -> Config:
         enrich_album_data=os.getenv("ENRICH_ALBUM_DATA", "true").lower() == "true",
         source_preference=os.getenv("SOURCE_PREFERENCES", os.getenv("SOURCE_PREFERENCE", "auto")),
         output_format=os.getenv("OUTPUT_FORMAT", "flac"),
-        save_cover_art_sidecar=os.getenv("SAVE_COVER_ART_SIDECAR", "false").lower() == "true",
+        save_cover_art_sidecar=os.getenv("SAVE_COVER_ART_SIDECAR", "true").lower() == "true",
         sources_enabled=os.getenv("SOURCES_ENABLED", ""),
         prefer_explicit=os.getenv("PREFER_EXPLICIT", "true").lower() == "true",
         strict_matching=os.getenv("STRICT_MATCHING", "false").lower() == "true",
