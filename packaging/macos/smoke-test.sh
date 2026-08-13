@@ -58,7 +58,7 @@ esac
 MAIN="$APP/Contents/MacOS/Vela"
 BACKEND_APP="$APP/Contents/Helpers/VelaBackend.app"
 BACKEND="$BACKEND_APP/Contents/MacOS/VelaBackend"
-FPCALC="$BACKEND_APP/Contents/Frameworks/_internal/tools/fpcalc"
+FPCALC="$BACKEND_APP/Contents/Frameworks/tools/fpcalc"
 INFO_PLIST="$APP/Contents/Info.plist"
 for required in "$MAIN" "$BACKEND" "$FPCALC" "$INFO_PLIST"; do
   [[ -e "$required" ]] || {
