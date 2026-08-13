@@ -180,7 +180,6 @@ if not 0.5 <= duration <= 2.0:
     raise SystemExit(f"unexpected fixture duration: {duration}")
 PY
 
-BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")"
 env -u VELA_TOOLS_DIR \
   -u VELA_TOOLS_CHECKSUMS \
   -u VELA_RELEASE_OWNER_METADATA \
@@ -188,12 +187,12 @@ env -u VELA_TOOLS_DIR \
 APP_PID="$!"
 
 ready=0
-for _ in $(seq 1 120); do
+for _ in $(seq 1 240); do
   if ! kill -0 "$APP_PID" 2>/dev/null; then
     echo "Vela exited during startup." >&2
     exit 1
   fi
-  if [[ "$(lsappinfo find "bundleid=$BUNDLE_ID" 2>/dev/null || true)" == ASN:* ]]; then
+  if grep -Fq "Vela DOM ready" "$TEMP_DIR/app.log"; then
     ready=1
     break
   fi
@@ -206,7 +205,7 @@ done
 
 # Wails can return macOS userCanceledErr while it asynchronously accepts the
 # quit event. Process termination below is the authoritative clean-quit check.
-osascript -e "tell application id \"$BUNDLE_ID\" to quit" || true
+osascript -e "tell application \"$APP\" to quit" || true
 for _ in $(seq 1 80); do
   if ! kill -0 "$APP_PID" 2>/dev/null; then
     APP_PID=""

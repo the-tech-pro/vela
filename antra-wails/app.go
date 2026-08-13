@@ -98,6 +98,7 @@ func (a *App) logWarningf(format string, args ...interface{}) {
 // occurs when the window is shown before the Svelte app has mounted.
 func (a *App) domReady(ctx context.Context) {
 	a.markPerf("dom_ready")
+	log.Print("Vela DOM ready")
 	wailsRuntime.WindowShow(ctx)
 	go a.cacheFfmpegPaths()
 	go a.startAutoSyncTicker(ctx)
