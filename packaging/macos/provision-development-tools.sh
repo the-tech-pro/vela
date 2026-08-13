@@ -192,7 +192,7 @@ metadata = {
             ),
             "source_offer": (
                 "Development CI input only; not approved for public release. "
-                "Replace with owner-reviewed source and license evidence."
+                "Owner review must supply source and license evidence before release."
             ),
             "files": [{"path": "fpcalc", "sha256": hashes["fpcalc"]}],
         },
