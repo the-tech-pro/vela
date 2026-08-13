@@ -1,11 +1,15 @@
 package main
 
 import (
+	"context"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEmbeddedArtworkCacheKeyUsesCompletePath(t *testing.T) {
@@ -75,6 +79,63 @@ func TestMediaTokensUseIndependentCryptoRandomValues(t *testing.T) {
 	}
 	if len(first) != 48 || len(second) != 48 || first == second {
 		t.Fatalf("expected distinct 192-bit hex tokens, got %q and %q", first, second)
+	}
+}
+
+func TestMediaServerStreamsAudioRangesAndStopsOnShutdown(t *testing.T) {
+	root := t.TempDir()
+	track := filepath.Join(root, "Artist", "Album", "01.wav")
+	if err := os.MkdirAll(filepath.Dir(track), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(track, []byte("0123456789"), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	app := NewApp()
+	app.configCache = Config{DownloadPath: root}
+	app.configCacheReady = true
+	baseURL := app.ensureMediaServer()
+	if baseURL == "" {
+		t.Fatal("media server did not start")
+	}
+	audioURL := app.mediaURL("audio", track)
+
+	request, err := http.NewRequest(http.MethodGet, audioURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Range", "bytes=2-5")
+	response, err := http.DefaultClient.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(response.Body)
+	_ = response.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if response.StatusCode != http.StatusPartialContent || string(body) != "2345" {
+		t.Fatalf("range response = %d %q", response.StatusCode, body)
+	}
+	if response.Header.Get("Accept-Ranges") != "bytes" {
+		t.Fatal("audio response did not advertise byte ranges")
+	}
+
+	unauthorized, err := http.Get(baseURL + "/media/audio?path=" + url.QueryEscape(track))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = unauthorized.Body.Close()
+	if unauthorized.StatusCode != http.StatusForbidden {
+		t.Fatalf("unauthorized response = %d, want 403", unauthorized.StatusCode)
+	}
+
+	app.shutdown(context.Background())
+	client := &http.Client{Timeout: time.Second}
+	if response, err := client.Get(audioURL); err == nil {
+		_ = response.Body.Close()
+		t.Fatal("media server still accepted requests after shutdown")
 	}
 }
 

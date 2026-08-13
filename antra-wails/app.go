@@ -93,6 +93,22 @@ func (a *App) logWarningf(format string, args ...interface{}) {
 	log.Printf("[WARN] "+format, args...)
 }
 
+func (a *App) logInfof(format string, args ...interface{}) {
+	if a != nil && a.runtimeReady.Load() && a.ctx != nil {
+		wailsRuntime.LogInfof(a.ctx, format, args...)
+		return
+	}
+	log.Printf("[INFO] "+format, args...)
+}
+
+func (a *App) logErrorf(format string, args ...interface{}) {
+	if a != nil && a.runtimeReady.Load() && a.ctx != nil {
+		wailsRuntime.LogErrorf(a.ctx, format, args...)
+		return
+	}
+	log.Printf("[ERROR] "+format, args...)
+}
+
 // domReady is called after the frontend DOM has finished loading.
 // We reveal the window here to avoid the white/unstyled flash that
 // occurs when the window is shown before the Svelte app has mounted.

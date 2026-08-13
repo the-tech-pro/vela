@@ -711,12 +711,12 @@ func (a *App) CancelDownload() {
 	// If we cancel() first, Go kills the parent PID, which breaks the
 	// tree relationship and taskkill /T can no longer find children.
 	if err := killCommandTree(cmd); err != nil {
-		wailsRuntime.LogErrorf(a.ctx, "Failed to stop library engine: %v", err)
+		a.logErrorf("Failed to stop library engine: %v", err)
 	}
 	if cancel != nil {
 		cancel()
 	}
-	wailsRuntime.LogInfof(a.ctx, "Download cancelled by user")
+	a.logInfof("Download cancelled by user")
 }
 
 type downloadControlState struct {

@@ -1137,7 +1137,6 @@ def _cleanup_debug_browser(launch_state: dict[str, object]) -> None:
     user_data_dir = str(launch_state.get("user_data_dir") or "").strip()
     if user_data_dir:
         shutil.rmtree(user_data_dir, ignore_errors=True)
-        shutil.rmtree(user_data_dir, ignore_errors=True)
 
 
 
