@@ -100,6 +100,22 @@ The result is `antra-wails/build/bin/Vela.app`. Its Python backend is an onedir
 helper at `Contents/Helpers/VelaBackend`; it is not extracted into a writable
 temporary directory at launch.
 
+An unsigned manual run of `.github/workflows/macos.yml` uses fresh
+GitHub-hosted native runners (`macos-14` for arm64 and `macos-15-intel` for
+amd64). It installs Homebrew FFmpeg/FFprobe/Chromaprint only for development,
+records their exact hashes and build metadata, builds and validates both native
+apps, ad-hoc signs them, runs the repository smoke baseline, and uploads:
+
+```text
+Vela-development-macOS-arm64/Vela-macOS-arm64.dmg
+Vela-development-macOS-amd64/Vela-macOS-amd64.dmg
+```
+
+These development DMGs prove that native packaging and launch paths work on
+clean Macs. They are not Developer ID signed, notarized, stapled, or approved
+for distribution. Protected release builds still use the owner-controlled
+native runners and inputs listed above.
+
 For an approved release identity and preconfigured `notarytool` keychain
 profile:
 

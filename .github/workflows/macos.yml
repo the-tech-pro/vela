@@ -48,13 +48,17 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        arch: [arm64, amd64]
-    runs-on: [self-hosted, macOS, "${{ matrix.arch }}"]
+        include:
+          - arch: arm64
+            hosted_runner: macos-14
+          - arch: amd64
+            hosted_runner: macos-15-intel
+    runs-on: ${{ inputs.sign_and_notarize && fromJSON(format('["self-hosted","macOS","{0}"]', matrix.arch)) || matrix.hosted_runner }}
     env:
       VELA_TARGET_ARCH: ${{ matrix.arch }}
-      VELA_TOOLS_DIR: /opt/vela-tools/${{ matrix.arch }}/bin
-      VELA_TOOLS_CHECKSUMS: /opt/vela-tools/${{ matrix.arch }}/SHA256SUMS
-      VELA_RELEASE_OWNER_METADATA: /opt/vela-tools/${{ matrix.arch }}/owner-metadata.json
+      VELA_TOOLS_DIR: ${{ inputs.sign_and_notarize && format('/opt/vela-tools/{0}/bin', matrix.arch) || format('{0}/.ci-tools/{1}/bin', github.workspace, matrix.arch) }}
+      VELA_TOOLS_CHECKSUMS: ${{ inputs.sign_and_notarize && format('/opt/vela-tools/{0}/SHA256SUMS', matrix.arch) || format('{0}/.ci-tools/{1}/SHA256SUMS', github.workspace, matrix.arch) }}
+      VELA_RELEASE_OWNER_METADATA: ${{ inputs.sign_and_notarize && format('/opt/vela-tools/{0}/owner-metadata.json', matrix.arch) || format('{0}/.ci-tools/{1}/owner-metadata.json', github.workspace, matrix.arch) }}
       VELA_BUNDLE_ID: ${{ vars.VELA_BUNDLE_ID }}
       VELA_ICON_ICNS: ${{ vars.VELA_ICON_ICNS }}
       MACOSX_DEPLOYMENT_TARGET: "12.0"
@@ -73,6 +77,15 @@ jobs:
           node-version: "18"
           cache: npm
           cache-dependency-path: antra-wails/frontend/package-lock.json
+
+      - name: Provision development media tools
+        if: ${{ !inputs.sign_and_notarize }}
+        shell: bash
+        run: |
+          brew install ffmpeg chromaprint
+          bash packaging/macos/provision-development-tools.sh \
+            "$GITHUB_WORKSPACE/.ci-tools/${{ matrix.arch }}" \
+            "${{ matrix.arch }}"
 
       - name: Verify native runner and tool inputs
         shell: bash
@@ -96,9 +109,11 @@ jobs:
           fi
 
       - name: Install build dependencies
+        shell: bash
         run: |
           python -m pip install -r requirements-test.txt
           go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
           npm ci --prefix antra-wails/frontend
 
       - name: Run release gates and tests
@@ -127,13 +142,35 @@ jobs:
           file antra-wails/build/bin/Vela.app/Contents/MacOS/Vela | grep -q "$(test '${{ matrix.arch }}' = arm64 && echo arm64 || echo x86_64)"
           /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' antra-wails/build/bin/Vela.app/Contents/Info.plist | grep -q '^12.0$'
 
-      - name: Archive unsigned app
+      - name: Package and smoke-test development DMG
+        if: ${{ !inputs.sign_and_notarize }}
+        shell: bash
+        run: |
+          bash packaging/macos/package-development.sh
+          bash packaging/macos/smoke-test.sh \
+            --app "$GITHUB_WORKSPACE/antra-wails/build/bin/Vela.app" \
+            --arch "${{ matrix.arch }}"
+
+      - name: Archive app
         run: ditto -c -k --sequesterRsrc --keepParent antra-wails/build/bin/Vela.app "Vela-${{ matrix.arch }}.zip"
 
-      - uses: actions/upload-artifact@v4
+      - name: Upload unsigned release input
+        if: ${{ inputs.sign_and_notarize }}
+        uses: actions/upload-artifact@v4
         with:
           name: Vela-unsigned-macOS-${{ matrix.arch }}
           path: Vela-${{ matrix.arch }}.zip
+          if-no-files-found: error
+
+      - name: Upload development build
+        if: ${{ !inputs.sign_and_notarize }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: Vela-development-macOS-${{ matrix.arch }}
+          path: |
+            Vela-${{ matrix.arch }}.zip
+            dist/development/Vela-macOS-${{ matrix.arch }}.dmg
+            dist/development/Vela-macOS-${{ matrix.arch }}.dmg.sha256
           if-no-files-found: error
 
   release-package:
