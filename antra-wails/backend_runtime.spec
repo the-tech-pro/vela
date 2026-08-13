@@ -96,6 +96,16 @@ datas.append((str(ROOT / "THIRD_PARTY_NOTICES.md"), "."))
 # but strip the 97 MB data payload.
 datas = [(src, dst) for src, dst in datas
          if "playwright" not in src.replace("\\", "/").lower()]
+# imageio-ffmpeg marks its binaries directory as package data. Its README is
+# not needed at runtime and macOS codesign can misclassify it as unsigned
+# nested code when PyInstaller preserves that directory's executable mode.
+datas = [
+    (src, dst)
+    for src, dst in datas
+    if not (
+        src.replace("\\", "/").lower().endswith("/imageio_ffmpeg/binaries/readme.md")
+    )
+]
 
 # ── Analysis ─────────────────────────────────────────────────────────────────
 # NOTE: collect_data_files("imageio_ffmpeg") already collects the ffmpeg binary
