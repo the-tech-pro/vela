@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -212,11 +213,8 @@ def test_trusted_mounted_hfs_uses_shared_readiness_contract(tmp_path) -> None:
     assert summary["needs_preparation"] is False
 
 
-def test_windows_mounted_path_matching_is_case_insensitive_and_read_only_safe(
-    tmp_path,
-) -> None:
-    from iopenpod.device.write_guard import DeviceWriteSafetyError
-
+@pytest.mark.skipif(os.name != "nt", reason="Windows paths are case-insensitive")
+def test_windows_mounted_path_matching_is_case_insensitive(tmp_path) -> None:
     mount = tmp_path / "CaseSensitiveName"
     mount.mkdir()
     device = SimpleNamespace(
@@ -234,6 +232,24 @@ def test_windows_mounted_path_matching_is_case_insensitive_and_read_only_safe(
     selected = adapter.identify_read_only(str(mount).swapcase())
     assert selected is device
 
+
+def test_mounted_read_only_volume_blocks_writes(tmp_path) -> None:
+    from iopenpod.device.write_guard import DeviceWriteSafetyError
+
+    mount = tmp_path / "MountedIPod"
+    mount.mkdir()
+    device = SimpleNamespace(
+        path=str(mount),
+        ipod_name="Mounted iPod",
+        model_family="iPod Classic",
+        serial="SERIAL",
+        firewire_guid="0011223344556677",
+        filesystem_type="fat32",
+        reported_volume_format="FAT32",
+        filesystem_accessible=True,
+    )
+    adapter = object.__new__(IOpenPodAdapter)
+    adapter.scan_read_only = lambda: [device]  # type: ignore[method-assign]
     adapter.inspect_write_readiness = lambda _device: (_ for _ in ()).throw(  # type: ignore[method-assign]
         DeviceWriteSafetyError("The volume is mounted read-only")
     )
