@@ -57,25 +57,27 @@ esac
 
 MAIN="$APP/Contents/MacOS/Vela"
 BACKEND="$APP/Contents/Helpers/VelaBackend/VelaBackend"
+FPCALC="$APP/Contents/Helpers/VelaBackend/_internal/tools/fpcalc"
 INFO_PLIST="$APP/Contents/Info.plist"
-for required in "$MAIN" "$BACKEND" "$INFO_PLIST"; do
+for required in "$MAIN" "$BACKEND" "$FPCALC" "$INFO_PLIST"; do
   [[ -e "$required" ]] || {
     echo "Missing required app resource: $required" >&2
     exit 1
   }
 done
-[[ -x "$MAIN" && -x "$BACKEND" ]] || {
-  echo "Vela and VelaBackend must both be executable." >&2
+[[ -x "$MAIN" && -x "$BACKEND" && -x "$FPCALC" ]] || {
+  echo "Vela, VelaBackend, and bundled fpcalc must be executable." >&2
   exit 1
 }
 
-for executable in "$MAIN" "$BACKEND"; do
+for executable in "$MAIN" "$BACKEND" "$FPCALC"; do
   slices="$(lipo -archs "$executable")"
   [[ " $slices " == *" $MACHO_ARCH "* ]] || {
     echo "Wrong architecture for $executable: expected $MACHO_ARCH, found $slices" >&2
     exit 1
   }
 done
+"$FPCALC" --help >/dev/null
 
 TEMP_DIR="$(mktemp -d)"
 APP_PID=""

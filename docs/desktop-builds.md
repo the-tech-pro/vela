@@ -102,9 +102,10 @@ temporary directory at launch.
 
 An unsigned manual run of `.github/workflows/macos.yml` uses fresh
 GitHub-hosted native runners (`macos-14` for arm64 and `macos-15-intel` for
-amd64). It installs Homebrew FFmpeg/FFprobe/Chromaprint only for development,
-records their exact hashes and build metadata, builds and validates both native
-apps, ad-hoc signs them, runs the repository smoke baseline, and uploads:
+amd64). It installs Homebrew FFmpeg/FFprobe and downloads the pinned official
+Chromaprint fpcalc binary only for development, records their exact hashes and
+build metadata, builds and validates both native apps, ad-hoc signs them, runs
+the repository smoke baseline, and uploads:
 
 ```text
 Vela-development-macOS-arm64/Vela-macOS-arm64.dmg

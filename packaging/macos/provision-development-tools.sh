@@ -23,11 +23,14 @@ python3 - "$OUTPUT_ROOT" "$MACHO_ARCH" <<'PY'
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import platform
 import shutil
 import subprocess
 import sys
+import tarfile
+import urllib.request
 from pathlib import Path
 
 output_root = Path(sys.argv[1]).resolve()
@@ -72,7 +75,63 @@ def copy_tool(name: str) -> Path:
     return destination
 
 
-tools = {name: copy_tool(name) for name in ("ffmpeg", "ffprobe", "fpcalc")}
+def download_fpcalc() -> tuple[Path, str]:
+    version = "1.5.1"
+    release_arch = {"arm64": "arm64", "x86_64": "x86_64"}[expected_arch]
+    expected_sha256 = {
+        "arm64": "104d69c88ee08a68bfaea692ea60b98a7ff3e80ac642affa4258adf4d958b396",
+        "x86_64": "e4355161dcfc56fe35b7058c7fb6cea19ca2bbe2de9d9b6141b5d8621bceec78",
+    }[expected_arch]
+    url = (
+        "https://github.com/acoustid/chromaprint/releases/download/"
+        f"v{version}/chromaprint-fpcalc-{version}-macos-{release_arch}.tar.gz"
+    )
+    with urllib.request.urlopen(url, timeout=60) as response:
+        archive = response.read()
+    actual_sha256 = hashlib.sha256(archive).hexdigest()
+    if actual_sha256 != expected_sha256:
+        raise SystemExit(
+            "official fpcalc archive SHA-256 mismatch: "
+            f"expected {expected_sha256}, got {actual_sha256}"
+        )
+
+    with tarfile.open(fileobj=io.BytesIO(archive), mode="r:gz") as bundle:
+        members = [
+            member
+            for member in bundle.getmembers()
+            if member.isfile() and Path(member.name).name == "fpcalc"
+        ]
+        if len(members) != 1:
+            raise SystemExit("official fpcalc archive did not contain exactly one fpcalc")
+        stream = bundle.extractfile(members[0])
+        if stream is None:
+            raise SystemExit("could not read fpcalc from the official archive")
+        destination = bin_dir / "fpcalc"
+        destination.write_bytes(stream.read())
+        destination.chmod(0o755)
+
+    architectures = subprocess.run(
+        ["lipo", "-archs", str(destination)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.split()
+    if expected_arch not in architectures:
+        raise SystemExit(
+            "official fpcalc has the wrong architecture: "
+            f"expected {expected_arch}, found {', '.join(architectures)}"
+        )
+    subprocess.run(
+        [str(destination), "--help"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return destination, version
+
+
+tools = {name: copy_tool(name) for name in ("ffmpeg", "ffprobe")}
+tools["fpcalc"], fpcalc_version = download_fpcalc()
 hashes = {
     name: hashlib.sha256(path.read_bytes()).hexdigest()
     for name, path in tools.items()
@@ -98,9 +157,6 @@ ffmpeg_version_line = output([str(tools["ffmpeg"]), "-version"]).splitlines()[0]
 ffmpeg_parts = ffmpeg_version_line.split()
 ffmpeg_version = ffmpeg_parts[2] if len(ffmpeg_parts) >= 3 else ffmpeg_version_line
 ffmpeg_configuration = output([str(tools["ffmpeg"]), "-buildconf"])
-
-fpcalc_version_text = output([str(tools["fpcalc"]), "-version"])
-fpcalc_version = fpcalc_version_text.split()[-1]
 
 metadata = {
     "media_tools": [
