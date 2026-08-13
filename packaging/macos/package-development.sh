@@ -33,7 +33,11 @@ is_macho() {
 # Ad-hoc signing does not establish distributable trust. It makes the
 # development app internally coherent so native CI can launch and test it.
 while IFS= read -r -d '' item; do
-  if [[ "$item" != "$APP/Contents/MacOS/Vela" ]] && is_macho "$item"; then
+  if ! is_macho "$item"; then
+    chmod a-x "$item"
+    continue
+  fi
+  if [[ "$item" != "$APP/Contents/MacOS/Vela" ]]; then
     codesign --force --sign - "$item"
   fi
 done < <(find "$APP/Contents" -type f -print0)

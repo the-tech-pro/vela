@@ -105,7 +105,13 @@ sign_nested_code() {
 # Sign every nested Mach-O leaf throughout the app, not only the helper.
 # The root app executable is deliberately deferred until all nested code.
 while IFS= read -r -d '' item; do
-  if [[ "$item" != "$APP/Contents/MacOS/Vela" ]] && is_macho "$item"; then
+  if ! is_macho "$item"; then
+    # PyInstaller can preserve executable bits on data such as README files.
+    # codesign then treats those files as unsigned nested code.
+    chmod a-x "$item"
+    continue
+  fi
+  if [[ "$item" != "$APP/Contents/MacOS/Vela" ]]; then
     sign_nested_code "$item"
   fi
 done < <(find "$APP/Contents" -type f -print0)
