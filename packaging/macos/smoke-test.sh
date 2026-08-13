@@ -95,9 +95,15 @@ mkdir -p "$TEMP_DIR/home"
 
 MEDIA_PATHS="$TEMP_DIR/media-paths.txt"
 IPOD_SCAN="$TEMP_DIR/ipod-scan.json"
-HOME="$TEMP_DIR/home" "$BACKEND" --get-ffmpeg-dir \
+env -u VELA_TOOLS_DIR \
+  -u VELA_TOOLS_CHECKSUMS \
+  -u VELA_RELEASE_OWNER_METADATA \
+  HOME="$TEMP_DIR/home" "$BACKEND" --get-ffmpeg-dir \
   >"$MEDIA_PATHS" 2>"$TEMP_DIR/media-stderr.log"
-HOME="$TEMP_DIR/home" "$BACKEND" --ipod-devices \
+env -u VELA_TOOLS_DIR \
+  -u VELA_TOOLS_CHECKSUMS \
+  -u VELA_RELEASE_OWNER_METADATA \
+  HOME="$TEMP_DIR/home" "$BACKEND" --ipod-devices \
   >"$IPOD_SCAN" 2>"$TEMP_DIR/ipod-stderr.log"
 
 TOOLS_ENV="$TEMP_DIR/tools.env"
@@ -168,7 +174,10 @@ if not 0.5 <= duration <= 2.0:
 PY
 
 BUNDLE_ID="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$INFO_PLIST")"
-HOME="$TEMP_DIR/home" "$MAIN" >"$TEMP_DIR/app.log" 2>&1 &
+env -u VELA_TOOLS_DIR \
+  -u VELA_TOOLS_CHECKSUMS \
+  -u VELA_RELEASE_OWNER_METADATA \
+  HOME="$TEMP_DIR/home" "$MAIN" >"$TEMP_DIR/app.log" 2>&1 &
 APP_PID="$!"
 
 ready=0
