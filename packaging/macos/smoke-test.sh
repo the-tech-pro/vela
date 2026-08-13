@@ -83,12 +83,19 @@ done
 TEMP_DIR="$(mktemp -d)"
 APP_PID=""
 cleanup() {
+  status=$?
+  if [[ "$status" -ne 0 && -s "$TEMP_DIR/app.log" ]]; then
+    echo "--- Vela application log ---" >&2
+    cat "$TEMP_DIR/app.log" >&2
+    echo "--- end Vela application log ---" >&2
+  fi
   if [[ -n "$APP_PID" ]] && kill -0 "$APP_PID" 2>/dev/null; then
     kill -TERM "$APP_PID" 2>/dev/null || true
     sleep 1
     kill -KILL "$APP_PID" 2>/dev/null || true
   fi
   rm -rf "$TEMP_DIR"
+  return "$status"
 }
 trap cleanup EXIT
 mkdir -p "$TEMP_DIR/home"
@@ -181,12 +188,12 @@ env -u VELA_TOOLS_DIR \
 APP_PID="$!"
 
 ready=0
-for attempt in $(seq 1 60); do
+for _ in $(seq 1 120); do
   if ! kill -0 "$APP_PID" 2>/dev/null; then
     echo "Vela exited during startup." >&2
     exit 1
   fi
-  if [[ "$attempt" -ge 8 ]]; then
+  if [[ "$(osascript -e "application id \"$BUNDLE_ID\" is running" 2>/dev/null || true)" == "true" ]]; then
     ready=1
     break
   fi
