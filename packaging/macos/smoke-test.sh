@@ -197,7 +197,9 @@ done
   exit 1
 }
 
-osascript -e "tell application id \"$BUNDLE_ID\" to quit"
+# Wails can return macOS userCanceledErr while it asynchronously accepts the
+# quit event. Process termination below is the authoritative clean-quit check.
+osascript -e "tell application id \"$BUNDLE_ID\" to quit" || true
 for _ in $(seq 1 80); do
   if ! kill -0 "$APP_PID" 2>/dev/null; then
     APP_PID=""
