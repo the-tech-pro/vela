@@ -120,8 +120,9 @@ jobs:
         run: |
           python packaging/ipod-unlock/verify_release_inputs.py
           python -m pytest -q
-          (cd antra-wails && go test ./...)
           npm run check --prefix antra-wails/frontend
+          npm run build --prefix antra-wails/frontend
+          (cd antra-wails && go test ./...)
 
       - name: Build native app
         shell: bash
