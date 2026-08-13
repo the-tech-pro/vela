@@ -79,8 +79,8 @@ def download_fpcalc() -> tuple[Path, str]:
     version = "1.5.1"
     release_arch = {"arm64": "arm64", "x86_64": "x86_64"}[expected_arch]
     expected_sha256 = {
-        "arm64": "104d69c88ee08a68bfaea692ea60b98a7ff3e80ac642affa4258adf4d958b396",
-        "x86_64": "e4355161dcfc56fe35b7058c7fb6cea19ca2bbe2de9d9b6141b5d8621bceec78",
+        "arm64": "9c5d9565d2396dbcf0e1d797e1ffdf1e19242f3bed88ac3200e144286b57ede6",
+        "x86_64": "c6c2797c4f087cf139eedd71554bc59ef8f26a783dc00c7f3ad5ae71d3a616fe",
     }[expected_arch]
     url = (
         "https://github.com/acoustid/chromaprint/releases/download/"
