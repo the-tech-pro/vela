@@ -8,7 +8,12 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from .ipod_service import IPodService, IPodServiceError, PROTOCOL_VERSION
+from .ipod_service import (
+    IPodService,
+    IPodServiceError,
+    PROTOCOL_VERSION,
+    _translate_write_safety_error,
+)
 
 
 def _emit(event_type: str, data: Any = None, **extra: Any) -> None:
@@ -271,7 +276,15 @@ def run_ipod_command(args: Any) -> int:
             message="iOpenPod 1.67.1 is not installed in the Vela backend.",
         )
         return 2
+    except PermissionError as exc:
+        translated = _translate_write_safety_error(exc)
+        _emit("ipod_error", code=translated.code, message=str(translated))
+        return 2
     except Exception as exc:
+        if exc.__class__.__name__ == "DeviceWriteSafetyError":
+            translated = _translate_write_safety_error(exc)
+            _emit("ipod_error", code=translated.code, message=str(translated))
+            return 2
         _emit("ipod_error", code="unexpected_error", message=str(exc))
         return 2
 

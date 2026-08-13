@@ -948,8 +948,17 @@ func (a *App) runIPodRequest(operation string, request interface{}, terminalType
 		return `{"error":"The iPod backend returned no result."}`
 	}
 	if terminal["type"] == "ipod_error" {
+		code, _ := terminal["code"].(string)
 		message, _ := terminal["message"].(string)
-		return `{"error":` + quoteJSON(message) + `}`
+		data, err := json.Marshal(map[string]string{
+			"error":   message,
+			"code":    code,
+			"message": message,
+		})
+		if err != nil {
+			return jsonError(err)
+		}
+		return string(data)
 	}
 	data, _ := json.Marshal(terminal["data"])
 	return string(data)

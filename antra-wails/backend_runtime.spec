@@ -199,6 +199,10 @@ if IS_DARWIN:
             "CFBundleDisplayName": "VelaBackend",
             "LSBackgroundOnly": True,
             "LSMinimumSystemVersion": "12.0",
+            "NSRemovableVolumesUsageDescription": (
+                "Vela needs removable-volume access to browse, back up, and "
+                "safely sync a connected iPod."
+            ),
         },
     )
 else:

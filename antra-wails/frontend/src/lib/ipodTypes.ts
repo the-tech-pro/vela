@@ -26,6 +26,9 @@ export interface IPodDevice {
   supports_sparse_artwork: boolean;
   browse_only: boolean;
   needs_preparation: boolean;
+  write_ready: boolean;
+  filesystem_read_only: boolean;
+  write_block_code: string;
   write_block_reason: string;
 }
 
@@ -657,6 +660,16 @@ export function recordStringArray(record: UnknownRecord, key: string): string[] 
     : [];
 }
 
+export class IPodBackendError extends Error {
+  code: string;
+
+  constructor(message: string, code = '') {
+    super(message);
+    this.name = 'IPodBackendError';
+    this.code = code;
+  }
+}
+
 export function parseIPodResponse(raw: string): UnknownRecord {
   let value: unknown;
   try {
@@ -666,7 +679,12 @@ export function parseIPodResponse(raw: string): UnknownRecord {
   }
   if (!isRecord(value)) throw new Error('The iPod backend returned an unexpected response.');
   const error = recordString(value, 'error');
-  if (error) throw new Error(error);
+  if (error) {
+    throw new IPodBackendError(
+      recordString(value, 'message', error),
+      recordString(value, 'code'),
+    );
+  }
   return value;
 }
 
@@ -697,13 +715,13 @@ const ipodDeviceStringFields = [
   'device_id', 'path', 'name', 'model_family', 'generation', 'model_number',
   'capacity', 'serial', 'firewire_guid', 'firmware', 'filesystem_type',
   'access_state', 'access_message', 'raw_device_path', 'volume_identity_key',
-  'write_block_reason',
+  'write_block_code', 'write_block_reason',
 ] as const;
 
 const ipodDeviceBooleanFields = [
   'filesystem_accessible', 'raw_read_only', 'uses_sqlite_db',
   'podcasts_supported', 'voice_memos_supported', 'supports_sparse_artwork',
-  'browse_only', 'needs_preparation',
+  'browse_only', 'needs_preparation', 'write_ready', 'filesystem_read_only',
 ] as const;
 
 export function isIPodDevice(value: unknown): value is IPodDevice {
@@ -746,6 +764,15 @@ function normalizeIPodDevice(value: unknown): IPodDevice | null {
   );
   const checksumType = value.checksum_type;
   const audioCodecs = value.audio_codecs;
+  const rawReadOnly = recordBoolean(value, 'raw_read_only', !filesystemAccessible);
+  const filesystemReadOnly = recordBoolean(value, 'filesystem_read_only', rawReadOnly);
+  const browseOnly = recordBoolean(value, 'browse_only', !filesystemAccessible);
+  const writeBlockReason = recordString(value, 'write_block_reason', accessMessage);
+  const writeReady = recordBoolean(
+    value,
+    'write_ready',
+    filesystemAccessible && !filesystemReadOnly && !browseOnly && !writeBlockReason,
+  );
 
   return {
     device_id: deviceId,
@@ -760,7 +787,7 @@ function normalizeIPodDevice(value: unknown): IPodDevice | null {
     firmware: recordString(value, 'firmware'),
     filesystem_type: recordString(value, 'filesystem_type'),
     filesystem_accessible: filesystemAccessible,
-    raw_read_only: recordBoolean(value, 'raw_read_only', !filesystemAccessible),
+    raw_read_only: rawReadOnly,
     access_state: recordString(
       value,
       'access_state',
@@ -782,9 +809,16 @@ function normalizeIPodDevice(value: unknown): IPodDevice | null {
     podcasts_supported: recordBoolean(value, 'podcasts_supported'),
     voice_memos_supported: recordBoolean(value, 'voice_memos_supported'),
     supports_sparse_artwork: recordBoolean(value, 'supports_sparse_artwork'),
-    browse_only: recordBoolean(value, 'browse_only', !filesystemAccessible),
+    browse_only: browseOnly,
     needs_preparation: recordBoolean(value, 'needs_preparation', !filesystemAccessible),
-    write_block_reason: recordString(value, 'write_block_reason', accessMessage),
+    write_ready: writeReady,
+    filesystem_read_only: filesystemReadOnly,
+    write_block_code: recordString(
+      value,
+      'write_block_code',
+      writeReady ? '' : filesystemAccessible ? 'write_not_ready' : 'filesystem_unavailable',
+    ),
+    write_block_reason: writeBlockReason,
   };
 }
 

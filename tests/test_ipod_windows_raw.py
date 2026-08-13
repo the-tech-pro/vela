@@ -136,6 +136,9 @@ def test_service_exposes_raw_device_but_adapter_blocks_operations(tmp_path) -> N
     assert summary["access_state"] == "mac_formatted_read_only"
     assert summary["browse_only"] is True
     assert summary["needs_preparation"] is True
+    assert summary["write_ready"] is False
+    assert summary["filesystem_read_only"] is True
+    assert summary["write_block_code"] == "filesystem_unavailable"
     assert "Mac-formatted HFS+" in summary["write_block_reason"]
 
     adapter = object.__new__(IOpenPodAdapter)
@@ -177,3 +180,66 @@ def test_mount_dependent_routes_reject_raw_hfs_device_before_access(tmp_path) ->
         with pytest.raises(IPodServiceError) as blocked:
             call()
         assert blocked.value.code == "filesystem_unavailable"
+
+
+def test_trusted_mounted_hfs_uses_shared_readiness_contract(tmp_path) -> None:
+    mount = tmp_path / "IPOD"
+    mount.mkdir()
+    device = SimpleNamespace(
+        path=str(mount),
+        ipod_name="Mounted Mac iPod",
+        model_family="iPod Classic",
+        serial="SERIAL",
+        firewire_guid="0011223344556677",
+        filesystem_type="hfs+",
+        reported_volume_format="Mac OS Extended",
+        filesystem_accessible=True,
+        raw_read_only=False,
+    )
+    profile = SimpleNamespace(safe_for_writes=True, read_only=False)
+    adapter = SimpleNamespace(
+        scan_read_only=lambda: [device],
+        inspect_write_readiness=lambda selected: (
+            profile if selected is device else None
+        ),
+    )
+
+    summary = IPodService(tmp_path / "app", adapter=adapter).scan()["devices"][0]
+    assert summary["write_ready"] is True
+    assert summary["filesystem_read_only"] is False
+    assert summary["write_block_code"] == ""
+    assert summary["browse_only"] is False
+    assert summary["needs_preparation"] is False
+
+
+def test_windows_mounted_path_matching_is_case_insensitive_and_read_only_safe(
+    tmp_path,
+) -> None:
+    from iopenpod.device.write_guard import DeviceWriteSafetyError
+
+    mount = tmp_path / "CaseSensitiveName"
+    mount.mkdir()
+    device = SimpleNamespace(
+        path=str(mount),
+        ipod_name="Mounted iPod",
+        model_family="iPod Classic",
+        serial="SERIAL",
+        firewire_guid="0011223344556677",
+        filesystem_type="fat32",
+        reported_volume_format="FAT32",
+        filesystem_accessible=True,
+    )
+    adapter = object.__new__(IOpenPodAdapter)
+    adapter.scan_read_only = lambda: [device]  # type: ignore[method-assign]
+    selected = adapter.identify_read_only(str(mount).swapcase())
+    assert selected is device
+
+    adapter.inspect_write_readiness = lambda _device: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        DeviceWriteSafetyError("The volume is mounted read-only")
+    )
+    summary = IPodService(tmp_path / "app", adapter=adapter).scan()["devices"][0]
+    assert summary["filesystem_accessible"] is True
+    assert summary["filesystem_read_only"] is True
+    assert summary["write_ready"] is False
+    assert summary["write_block_code"] == "volume_read_only"
+    assert summary["browse_only"] is True

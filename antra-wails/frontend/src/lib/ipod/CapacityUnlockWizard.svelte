@@ -1973,14 +1973,14 @@
   .unlock-shell {
     --surface-soft: var(--surface-2);
     --danger: var(--error-color);
-    --danger-line: color-mix(in srgb, var(--error-color) 40%, var(--line));
-    --danger-soft: color-mix(in srgb, var(--surface) 88%, var(--error-color) 12%);
+    --danger-line: var(--error-border);
+    --danger-soft: var(--error-soft);
     --warning: var(--warning-color);
-    --warning-line: color-mix(in srgb, var(--warning-color) 40%, var(--line));
-    --warning-soft: color-mix(in srgb, var(--surface) 88%, var(--warning-color) 12%);
+    --warning-line: var(--warning-border);
+    --warning-soft: var(--warning-soft);
     --success: var(--success-color);
-    --success-line: color-mix(in srgb, var(--success-color) 40%, var(--line));
-    --success-soft: color-mix(in srgb, var(--surface) 88%, var(--success-color) 12%);
+    --success-line: var(--success-border);
+    --success-soft: var(--success-soft);
     display: grid;
     gap: 16px;
     min-width: 0;

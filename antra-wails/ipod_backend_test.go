@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -99,6 +100,50 @@ func TestScanIPodEventsIgnoresNoiseAndKeepsStructuredProgress(t *testing.T) {
 	if events[0]["type"] != "ipod_progress" || events[1]["type"] != "ipod_execute" {
 		t.Fatalf("unexpected events: %#v", events)
 	}
+}
+
+func TestRunIPodRequestPreservesBackendErrorCodeAndMessage(t *testing.T) {
+	app := NewApp()
+	app.ipodCommandFactory = func(
+		_ context.Context,
+		_ string,
+		_ interface{},
+	) (*exec.Cmd, *bufio.Scanner, func(), error) {
+		cmd := exec.Command(
+			os.Args[0],
+			"-test.run=^TestIPodErrorFixtureProcess$",
+		)
+		cmd.Env = append(os.Environ(), "VELA_IPOD_ERROR_FIXTURE=1")
+		output, err := cmd.StdoutPipe()
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return cmd, bufio.NewScanner(output), func() {}, nil
+	}
+
+	raw := app.runIPodRequest("plan", nil, "ipod_plan")
+	var response map[string]string
+	if err := json.Unmarshal([]byte(raw), &response); err != nil {
+		t.Fatal(err)
+	}
+	if response["code"] != "volume_read_only" {
+		t.Fatalf("code = %q, want volume_read_only", response["code"])
+	}
+	if response["error"] != "The volume is mounted read-only." ||
+		response["message"] != response["error"] {
+		t.Fatalf("unexpected response: %#v", response)
+	}
+}
+
+func TestIPodErrorFixtureProcess(t *testing.T) {
+	if os.Getenv("VELA_IPOD_ERROR_FIXTURE") != "1" {
+		return
+	}
+	_, _ = os.Stdout.WriteString(
+		"{\"type\":\"ipod_error\",\"code\":\"volume_read_only\"," +
+			"\"message\":\"The volume is mounted read-only.\"}\n",
+	)
+	os.Exit(2)
 }
 
 func TestThirdPartyNoticeContainsFullMITGrant(t *testing.T) {

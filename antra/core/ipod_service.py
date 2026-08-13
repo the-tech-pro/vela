@@ -9,6 +9,7 @@ No GUI/iopenpod.gui module is imported here.
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import json
 import math
@@ -208,25 +209,146 @@ def _discovery_path_key(path: str | Path) -> str:
         )
 
 
-def _safe_row(row: Mapping[str, Any]) -> dict[str, Any]:
-    """Bound parser output to fields the desktop can safely render."""
-    allowed = (
-        "id", "dbid", "persistent_id", "title", "artist", "album",
-        "album_artist", "genre", "composer", "location", "duration",
-        "track_number", "track_count", "disc_number", "disc_count",
-        "year", "rating", "play_count", "skip_count", "date_added",
-        "filetype", "mediatype", "podcast", "video", "items",
-    )
+_BROWSE_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "id": ("id", "ID"),
+    "dbid": ("dbid", "DBID"),
+    "persistent_id": ("persistent_id", "Persistent ID", "PersistentID"),
+    "track_id": ("track_id", "Track ID", "TrackID"),
+    "db_track_id": ("db_track_id", "DB Track ID", "DBTrackID"),
+    "album_id": ("album_id", "Album ID", "AlbumID"),
+    "artist_id": ("artist_id", "Artist ID", "ArtistID"),
+    "sql_id": ("sql_id", "SQL ID", "SQLID"),
+    "title": ("title", "Title"),
+    "artist": (
+        "artist",
+        "Artist",
+        "Artist (Used by Album Item)",
+        "Artist (Used by Artist Item)",
+    ),
+    "album": ("album", "Album", "Album (Used by Album Item)"),
+    "album_artist": (
+        "album_artist",
+        "Album Artist",
+        "AlbumArtist",
+    ),
+    "genre": ("genre", "Genre"),
+    "composer": ("composer", "Composer"),
+    "location": ("location", "Location"),
+    "duration": ("duration", "Duration", "track_length", "length"),
+    "track_number": ("track_number", "Track Number", "TrackNumber"),
+    "track_count": (
+        "track_count",
+        "Track Count",
+        "TrackCount",
+        "total_tracks",
+    ),
+    "disc_number": ("disc_number", "Disc Number", "DiscNumber"),
+    "disc_count": ("disc_count", "Disc Count", "DiscCount", "total_discs"),
+    "year": ("year", "Year"),
+    "rating": ("rating", "Rating"),
+    "play_count": ("play_count", "Play Count", "PlayCount", "play_count_1"),
+    "skip_count": ("skip_count", "Skip Count", "SkipCount"),
+    "date_added": ("date_added", "Date Added", "DateAdded"),
+    "filetype": ("filetype", "Filetype", "File Type"),
+    "mediatype": ("mediatype", "Media Type", "MediaType"),
+    "podcast": ("podcast", "Podcast"),
+    "video": ("video", "Video"),
+}
+_BROWSE_ITEM_FIELD_ALIASES: dict[str, tuple[str, ...]] = {
+    "id": ("id", "ID"),
+    "dbid": ("dbid", "DBID"),
+    "persistent_id": ("persistent_id", "Persistent ID", "PersistentID"),
+    "track_id": ("track_id", "Track ID", "TrackID"),
+    "db_track_id": ("db_track_id", "DB Track ID", "DBTrackID"),
+    "group_id": ("group_id", "Group ID", "GroupID"),
+    "position": ("position", "Position"),
+}
+
+
+def _safe_scalar(value: Any) -> str | int | float | bool | None:
+    if isinstance(value, str):
+        return value[:2_000]
+    if isinstance(value, float):
+        return value if math.isfinite(value) else None
+    if isinstance(value, (int, bool)) or value is None:
+        return value
+    raise TypeError
+
+
+def _safe_alias_fields(
+    row: Mapping[str, Any],
+    aliases: Mapping[str, tuple[str, ...]],
+) -> dict[str, Any]:
     result: dict[str, Any] = {}
-    for key in allowed:
-        if key not in row:
-            continue
-        value = row[key]
-        if key == "items" and isinstance(value, list):
-            result[key] = [_jsonable(item) for item in value[:500]]
-        elif isinstance(value, (str, int, float, bool)) or value is None:
-            result[key] = value
+    for output_key, accepted_keys in aliases.items():
+        for input_key in accepted_keys:
+            if input_key not in row:
+                continue
+            try:
+                result[output_key] = _safe_scalar(row[input_key])
+            except TypeError:
+                pass
+            break
     return result
+
+
+def _safe_row(row: Mapping[str, Any]) -> dict[str, Any]:
+    """Normalize only approved parser fields into Vela's bounded browse schema."""
+    result = _safe_alias_fields(row, _BROWSE_FIELD_ALIASES)
+    items = row.get("items")
+    if isinstance(items, list):
+        result["items"] = [
+            _safe_alias_fields(item, _BROWSE_ITEM_FIELD_ALIASES)
+            for item in items[:500]
+            if isinstance(item, Mapping)
+        ]
+    return result
+
+
+def _translate_write_safety_error(exc: BaseException) -> IPodServiceError:
+    """Map expected removable-volume failures to stable public error codes."""
+    text = str(exc).strip()
+    lowered = text.casefold()
+    error_number = getattr(exc, "errno", None)
+    if (
+        isinstance(exc, PermissionError)
+        or error_number in {errno.EACCES, errno.EPERM}
+        or "permission denied" in lowered
+        or "operation not permitted" in lowered
+        or "access is denied" in lowered
+    ):
+        return IPodServiceError(
+            "removable_volume_permission_denied",
+            "Vela does not have permission to write to this removable volume. "
+            "On macOS, allow Removable Volumes access for Vela, then reconnect "
+            "the iPod and try again.",
+        )
+    if "read-only" in lowered or "read only" in lowered or error_number == errno.EROFS:
+        return IPodServiceError(
+            "volume_read_only",
+            "The iPod volume is mounted read-only. Remount it read/write or repair "
+            "the filesystem before syncing.",
+        )
+    if "unsupported filesystem" in lowered:
+        return IPodServiceError(
+            "unsupported_filesystem",
+            "The mounted iPod filesystem is not supported for safe writes. Vela "
+            "supports mounted FAT32 and trusted mounted HFS+ iPod volumes only.",
+        )
+    if (
+        "identity" in lowered
+        or "not mounted as its own volume" in lowered
+        or "unrecognized volume" in lowered
+    ):
+        return IPodServiceError(
+            "incomplete_volume_identity",
+            "Vela could not verify the mounted iPod volume identity. Reconnect the "
+            "device and ensure its filesystem is mounted before writing.",
+        )
+    return IPodServiceError(
+        "write_safety_failed",
+        text or "The iPod failed Vela's write-safety inspection.",
+    )
 
 
 class IOpenPodAdapter:
@@ -1016,6 +1138,20 @@ class IPodService:
         devices = [self._device_summary(device) for device in self.adapter.scan_read_only()]
         return {"protocol_version": PROTOCOL_VERSION, "devices": devices}
 
+    def _inspect_write_readiness(self, device: Any) -> Any:
+        try:
+            return self.adapter.inspect_write_readiness(device)
+        except IPodServiceError:
+            raise
+        except Exception as exc:
+            if (
+                exc.__class__.__name__ == "DeviceWriteSafetyError"
+                or isinstance(exc, PermissionError)
+                or isinstance(exc, OSError)
+            ):
+                raise _translate_write_safety_error(exc) from exc
+            raise
+
     def watch(
         self,
         emit: Callable[[dict[str, Any]], None],
@@ -1567,7 +1703,7 @@ class IPodService:
     ) -> dict[str, Any]:
         device = self.adapter.identify_read_only(mount_path)
         self._require_supported_identity(device)
-        profile = self.adapter.inspect_write_readiness(device)
+        profile = self._inspect_write_readiness(device)
         volume_key = self.adapter.volume_key(profile)
         archive_id = self._backup_archive_id(device)
         if not self._mutation_lock.acquire(blocking=False):
@@ -1845,7 +1981,7 @@ class IPodService:
                 "This backup archive belongs to a different iPod. Raw restore to "
                 "a replacement device is blocked.",
             )
-        profile = self.adapter.inspect_write_readiness(device)
+        profile = self._inspect_write_readiness(device)
         volume_key = self.adapter.volume_key(profile)
         generation = self.adapter.capture_database_generation(device.path)
         manifest, _entries, fingerprint = self._load_backup_manifest(
@@ -2160,7 +2296,7 @@ class IPodService:
         snapshot_id = self._validate_snapshot_id(snapshot_id)
         device = self.adapter.identify_read_only(mount_path)
         self._require_supported_identity(device)
-        profile = self.adapter.inspect_write_readiness(device)
+        profile = self._inspect_write_readiness(device)
         manifest, entries, fingerprint = self._load_backup_manifest(
             archive_id,
             snapshot_id,
@@ -2672,7 +2808,7 @@ class IPodService:
         free_bytes = int(float(getattr(device, "free_space_gb", 0) or 0) * 1_000_000_000)
         if estimated > free_bytes:
             raise IPodServiceError("insufficient_space", "The reviewed additions exceed the iPod's free space.")
-        profile = self.adapter.inspect_write_readiness(device)
+        profile = self._inspect_write_readiness(device)
         volume_key = self.adapter.volume_key(profile)
         plan_id = secrets.token_urlsafe(24)
         record = {
@@ -3426,17 +3562,40 @@ class IPodService:
             and getattr(device, "firewire_guid", "")
         )
         supported = family.casefold() in SUPPORTED_FAMILIES
-        browse_only = not (filesystem_accessible and complete and supported)
+        write_ready = False
+        filesystem_read_only = bool(
+            getattr(device, "raw_read_only", False)
+            or getattr(device, "filesystem_read_only", False)
+        )
+        write_block_code = ""
         reason = ""
         if not filesystem_accessible:
+            write_block_code = "filesystem_unavailable"
             reason = str(
                 getattr(device, "access_message", "")
                 or "The attached iPod filesystem is not mounted."
             )
         elif not supported:
+            write_block_code = "unsupported_device"
             reason = "iPod Touch and Shuffle are not supported for Vela sync."
         elif not complete:
+            write_block_code = "incomplete_volume_identity"
             reason = "Device identity is incomplete; preparation is required before writes."
+        else:
+            try:
+                profile = self._inspect_write_readiness(device)
+                filesystem_read_only = bool(getattr(profile, "read_only", False))
+                write_ready = bool(getattr(profile, "safe_for_writes", False))
+                if not write_ready:
+                    write_block_code = "write_safety_failed"
+                    reason = "The mounted iPod did not pass write-safety inspection."
+            except IPodServiceError as exc:
+                write_block_code = exc.code
+                reason = str(exc)
+                filesystem_read_only = (
+                    filesystem_read_only or exc.code == "volume_read_only"
+                )
+        browse_only = not (supported and write_ready)
         return {
             "device_id": stable,
             "path": str(device.path),
@@ -3459,7 +3618,14 @@ class IPodService:
             "voice_memos_supported": bool(getattr(device, "voice_memos_supported", False)),
             "supports_sparse_artwork": bool(getattr(device, "supports_sparse_artwork", False)),
             "browse_only": browse_only,
-            "needs_preparation": not filesystem_accessible or complete is False,
+            "needs_preparation": (
+                not filesystem_accessible
+                or complete is False
+                or (supported and not write_ready)
+            ),
+            "write_ready": write_ready,
+            "filesystem_read_only": filesystem_read_only,
+            "write_block_code": write_block_code,
             "write_block_reason": reason,
             "filesystem_accessible": filesystem_accessible,
             "raw_read_only": bool(getattr(device, "raw_read_only", False)),
@@ -3482,7 +3648,7 @@ class IPodService:
         ).strip()
         if not allow_incomplete and not (serial and guid):
             raise IPodServiceError(
-                "incomplete_identity",
+                "incomplete_volume_identity",
                 "Both the iPod serial and FireWire identity are required; writes are disabled.",
             )
         if serial and guid:
@@ -3570,7 +3736,7 @@ class IPodService:
             raise IPodServiceError("unsupported_device", "Vela sync supports iPod Classic, Mini, and Nano only.")
         if require_writable:
             self._stable_device_id(device)
-            self.adapter.inspect_write_readiness(device)
+            self._inspect_write_readiness(device)
         else:
             self._stable_device_id(device, allow_incomplete=True)
 
@@ -4215,7 +4381,7 @@ class IPodService:
                 "wrong_migration_target",
                 "A different iPod is mounted at the reviewed migration path.",
             )
-        profile = self.adapter.inspect_write_readiness(device)
+        profile = self._inspect_write_readiness(device)
         if self.adapter.volume_key(profile) != record["volume_identity_key"]:
             raise IPodServiceError(
                 "wrong_migration_target",
@@ -4361,7 +4527,7 @@ class IPodService:
                 "wrong_restore_target",
                 "The mounted iPod no longer matches the reviewed backup archive.",
             )
-        profile = self.adapter.inspect_write_readiness(device)
+        profile = self._inspect_write_readiness(device)
         if self.adapter.volume_key(profile) != record["volume_identity_key"]:
             raise IPodServiceError(
                 "wrong_restore_target",
@@ -5021,7 +5187,7 @@ class IPodService:
         self._require_supported_identity(device)
         if self._stable_device_id(device) != record["device_id"]:
             raise IPodServiceError("device_changed", "A different iPod is mounted at the reviewed path.")
-        profile = self.adapter.inspect_write_readiness(device)
+        profile = self._inspect_write_readiness(device)
         if self.adapter.volume_key(profile) != record["volume_identity_key"]:
             raise IPodServiceError("device_changed", "The mounted volume identity changed after review.")
         generation = self.adapter.capture_database_generation(device.path)

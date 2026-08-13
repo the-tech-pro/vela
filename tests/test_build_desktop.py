@@ -31,6 +31,13 @@ class BuildModeAndMetadataTests(unittest.TestCase):
         self.assertIn("@VELA_VERSION@", template)
         self.assertNotIn(f"<string>{__version__}</string>", template)
 
+    def test_backend_helper_declares_removable_volume_usage_without_sandbox(self):
+        spec = (
+            build.ROOT / "antra-wails" / "backend_runtime.spec"
+        ).read_text(encoding="utf-8")
+        self.assertIn('"NSRemovableVolumesUsageDescription"', spec)
+        self.assertNotIn("com.apple.security.app-sandbox", spec)
+
     def test_release_metadata_requires_real_bundle_id_and_valid_icns(self):
         with self.assertRaisesRegex(SystemExit, "require VELA_BUNDLE_ID"):
             build.resolve_macos_metadata("release", {})

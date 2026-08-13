@@ -16,6 +16,7 @@ from antra.core.ipod_service import (
     IPodService,
     IPodServiceError,
 )
+from antra.core import ipod_cli
 from antra.core.ipod_cli import add_ipod_arguments
 from antra.core.ipod_migration import _payload_fingerprint
 
@@ -124,6 +125,8 @@ class FakeAdapter:
             identity=SimpleNamespace(is_complete=True),
             volume_identity_key=self.device.volume_identity_key,
             reported_volume_format="FAT32",
+            read_only=False,
+            safe_for_writes=True,
         )
         self.library = {
             "mhlt": [
@@ -252,6 +255,139 @@ def test_browse_is_paged_and_bounded(setup):
     assert result["total"] == 3
     assert [row["title"] for row in result["items"]] == ["Three"]
     assert "secret" not in result["items"][0]
+
+
+def test_browse_normalizes_real_iopenpod_mhod_casing_and_collection_keys(setup):
+    service, adapter, _source = setup
+    adapter.library["mhlt"] = [{
+        "track_id": 12,
+        "db_track_id": 9001,
+        "Title": "Real Title",
+        "Artist": "Real Artist",
+        "Album": "Real Album",
+        "Album Artist": "Album Artist",
+        "Genre": "Rock",
+        "Composer": "Composer",
+        "Location": ":iPod_Control:Music:F00:track.mp3",
+        "track_number": 3,
+        "total_tracks": 10,
+        "disc_number": 1,
+        "total_discs": 2,
+        "year": 2007,
+        "rating": 80,
+        "play_count_1": 14,
+        "skip_count": 2,
+        "unapproved_parser_field": "must not escape",
+    }]
+    adapter.library["mhla"] = [{
+        "Album (Used by Album Item)": "Collection Album",
+        "Artist (Used by Album Item)": "Collection Artist",
+    }]
+    adapter.library["mhsd_type_8"] = [{
+        "Artist (Used by Artist Item)": "Artist Index Name",
+    }]
+
+    track = service.browse(adapter.device.path, "tracks")["items"][0]
+    assert track == {
+        "track_id": 12,
+        "db_track_id": 9001,
+        "title": "Real Title",
+        "artist": "Real Artist",
+        "album": "Real Album",
+        "album_artist": "Album Artist",
+        "genre": "Rock",
+        "composer": "Composer",
+        "location": ":iPod_Control:Music:F00:track.mp3",
+        "track_number": 3,
+        "track_count": 10,
+        "disc_number": 1,
+        "disc_count": 2,
+        "year": 2007,
+        "rating": 80,
+        "play_count": 14,
+        "skip_count": 2,
+    }
+    assert service.browse(adapter.device.path, "albums")["items"] == [{
+        "artist": "Collection Artist",
+        "album": "Collection Album",
+    }]
+    assert service.browse(adapter.device.path, "artists")["items"] == [{
+        "artist": "Artist Index Name",
+    }]
+
+
+def test_scan_reports_write_ready_contract_for_mounted_volume(setup):
+    service, _adapter, _source = setup
+    summary = service.scan()["devices"][0]
+
+    assert summary["write_ready"] is True
+    assert summary["filesystem_read_only"] is False
+    assert summary["write_block_code"] == ""
+    assert summary["write_block_reason"] == ""
+    assert summary["browse_only"] is False
+    assert summary["needs_preparation"] is False
+
+
+@pytest.mark.parametrize(
+    ("safety_message", "code", "read_only"),
+    [
+        (
+            "The iPod filesystem is not safe for writing: the volume is mounted read-only.",
+            "volume_read_only",
+            True,
+        ),
+        (
+            "diskutil failed: Operation not permitted",
+            "removable_volume_permission_denied",
+            False,
+        ),
+        (
+            "The selected physical iPod uses an unsupported filesystem (exfat).",
+            "unsupported_filesystem",
+            False,
+        ),
+        (
+            "The mounted volume identity could not be verified.",
+            "incomplete_volume_identity",
+            False,
+        ),
+    ],
+)
+def test_scan_classifies_iopenpod_write_safety_failures(
+    setup,
+    safety_message,
+    code,
+    read_only,
+):
+    from iopenpod.device.write_guard import DeviceWriteSafetyError
+
+    service, adapter, _source = setup
+    adapter.inspect_write_readiness = lambda _device: (_ for _ in ()).throw(
+        DeviceWriteSafetyError(safety_message)
+    )
+
+    summary = service.scan()["devices"][0]
+    assert summary["write_ready"] is False
+    assert summary["filesystem_read_only"] is read_only
+    assert summary["write_block_code"] == code
+    assert summary["write_block_reason"]
+    assert summary["browse_only"] is True
+    assert summary["needs_preparation"] is True
+
+    # Readiness is advisory for browsing; an accessible mounted filesystem
+    # remains readable even when writes are blocked.
+    assert service.browse(adapter.device.path, "tracks")["total"] == 3
+
+
+def test_permission_error_is_stable_at_service_boundary(setup):
+    service, adapter, source = setup
+    adapter.inspect_write_readiness = lambda _device: (_ for _ in ()).throw(
+        PermissionError("diskutil: Permission denied")
+    )
+
+    with pytest.raises(IPodServiceError) as failure:
+        service.create_plan(adapter.device.path, [source])
+    assert failure.value.code == "removable_volume_permission_denied"
 
 
 def test_rejects_stale_device_identity_and_database_generation(setup):
@@ -1110,6 +1246,32 @@ def test_cli_parser_exposes_backup_and_recovery_operations():
         "migration-preflight",
         "migration",
     }.issubset(set(operation_action.choices))
+
+
+def test_cli_translates_device_write_safety_error(monkeypatch, capsys, tmp_path):
+    from iopenpod.device.write_guard import DeviceWriteSafetyError
+
+    class UnsafeService:
+        def __init__(self, _app_data):
+            pass
+
+        def scan(self):
+            raise DeviceWriteSafetyError("The volume is mounted read-only")
+
+    monkeypatch.setattr(ipod_cli, "IPodService", UnsafeService)
+    args = SimpleNamespace(
+        ipod_request="",
+        ipod_app_data=str(tmp_path),
+        ipod_operation="scan",
+        ipod_cancel_file="",
+        config="",
+    )
+
+    assert ipod_cli.run_ipod_command(args) == 2
+    event = json.loads(capsys.readouterr().out)
+    assert event["type"] == "ipod_error"
+    assert event["code"] == "volume_read_only"
+    assert "read-only" in event["message"]
 
 
 def test_real_iopenpod_backup_repository_lifecycle(tmp_path):

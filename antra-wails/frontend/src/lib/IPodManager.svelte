@@ -83,7 +83,12 @@
   $: browsePages = Math.max(1, Math.ceil(browseTotal / browsePageSize));
   $: operationActive = isIPodOperationActive(operationEnvelope);
   $: filesystemUnavailable = device.filesystem_accessible === false;
-  $: writeBlocked = !connected || filesystemUnavailable || device.browse_only || capacityUnlockActive || mutationRunning || operationActive || planning || downloadBusy || ejecting;
+  $: deviceWriteBlocked = !device.write_ready || device.filesystem_read_only || device.browse_only;
+  $: writeBlocked = !connected || filesystemUnavailable || deviceWriteBlocked || capacityUnlockActive || mutationRunning || operationActive || planning || downloadBusy || ejecting;
+  $: writeGuidance = device.write_block_reason
+    || (device.filesystem_read_only
+      ? 'This mounted filesystem is read-only. Remount it with write access, then scan again.'
+      : 'This iPod is not verified for writes. Reconnect it directly and scan again.');
   $: if (filesystemUnavailable && activeTab !== 'overview') activeTab = 'overview';
   $: if (activeTab === 'advanced') advancedLoaded = true;
   $: if (ipodEvent && ipodEvent !== handledEvent) {
@@ -269,9 +274,9 @@
   }
 
   export async function reviewCompletedFiles(files: string[]) {
-    if (filesystemUnavailable) {
-      activeTab = 'overview';
-      announcement = 'Mac-formatted iPod detected. Vela made no writes.';
+    if (filesystemUnavailable || deviceWriteBlocked) {
+      activeTab = filesystemUnavailable ? 'overview' : 'sync';
+      announcement = writeGuidance;
       return;
     }
     const mountRoot = device.path.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase();
@@ -312,9 +317,9 @@
   }
 
   export function showPlan(nextPlan: IPodPlan) {
-    if (filesystemUnavailable) {
-      activeTab = 'overview';
-      announcement = 'Mac-formatted iPod detected. Vela made no writes.';
+    if (filesystemUnavailable || deviceWriteBlocked) {
+      activeTab = filesystemUnavailable ? 'overview' : 'sync';
+      announcement = writeGuidance;
       return;
     }
     plan = nextPlan;
@@ -462,8 +467,8 @@
     <div class="safety-banner warning filesystem-warning" role="status"><AlertTriangle size={20}/><div><strong>Mac-formatted iPod detected</strong><span>{device.access_message || 'Windows has not mounted this HFS+ filesystem, so the device remains read-only.'}</span><small>Vela made no writes. Filesystem-dependent browsing, backup, sync, and eject actions remain disabled.</small></div></div>
   {:else if capacityUnlockActive}
     <div class="safety-banner warning"><LockKeyhole size={18}/><div><strong>Capacity-unlock session active</strong><span>Normal sync, backup, browse, and eject controls stay locked until the persisted workflow completes or is safely cancelled.</span></div></div>
-  {:else if device.write_block_reason}
-    <div class="safety-banner" class:warning={device.needs_preparation}><AlertTriangle size={18}/><div><strong>{device.browse_only ? 'Browse only' : 'Device notice'}</strong><span>{device.write_block_reason}</span>{#if device.needs_preparation}<small>No preparation API is available; Vela will not write this device.</small>{/if}</div></div>
+  {:else if deviceWriteBlocked}
+    <div class="safety-banner warning" role="status"><AlertTriangle size={18}/><div><strong>{device.browse_only ? 'Browse only' : 'Writes unavailable'}</strong><span>{writeGuidance}</span>{#if device.write_block_code}<small>Code: {device.write_block_code.replace(/_/g, ' ')}</small>{/if}</div></div>
   {:else}
     <div class="safety-banner safe"><ShieldCheck size={18}/><div><strong>Verified for reviewed sync</strong><span>Every write still requires plan review, confirmation, and a fresh mandatory backup.</span></div></div>
   {/if}
@@ -624,6 +629,7 @@
 
       <section class="plan-review">
         <header><div><p>Reviewed plan</p><h3>{plan ? 'Review every effect' : 'No plan created'}</h3></div>{#if plan}<small>Expires {new Date(plan.expires_at * 1000).toLocaleTimeString()}</small>{/if}</header>
+        {#if deviceWriteBlocked}<div class="safety-banner warning" role="status"><AlertTriangle size={17}/><span>{writeGuidance}</span></div>{/if}
         {#if planError}<div class="inline-error">{planError}</div>{/if}
         {#if planStale}<div class="safety-banner warning"><AlertTriangle size={17}/><span>This plan is stale. Recreate and review it before syncing.</span></div>{/if}
         {#if plan}
@@ -667,13 +673,13 @@
   .device-hero p,.local-picker header p,.plan-review header p{margin:0;color:var(--accent);font-size:10px;font-weight:700;text-transform:uppercase;letter-spacing:.08em}
   .device-hero h2{margin:3px 0;font-size:28px}.device-hero>div>span{color:var(--muted);font-size:11px}.hero-actions{display:flex;align-items:center;gap:6px}
   button{border:0;cursor:pointer}.primary,.secondary,.danger{min-height:38px;display:inline-flex;align-items:center;justify-content:center;gap:7px;padding:0 14px;border-radius:10px;font-size:12px;font-weight:650}.primary{background:var(--accent);color:var(--bg)}.secondary{background:var(--surface-2);color:var(--text)}.danger{background:var(--error-color);color:var(--bg)}.icon{width:36px;height:36px;display:grid;place-items:center;padding:0;border-radius:9px;background:var(--surface-2);color:var(--muted)}button:disabled{opacity:var(--disabled-opacity);cursor:default}
-  .safety-banner{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--muted)}.safety-banner.safe{border-color:color-mix(in srgb,var(--success-color) 35%,var(--line));color:var(--success-color)}.safety-banner.warning{border-color:color-mix(in srgb,var(--warning-color) 45%,var(--line));color:var(--warning-color)}.safety-banner>div{display:grid;gap:3px}.safety-banner span,.safety-banner small{color:var(--muted);font-size:11px}
-  .filesystem-warning{padding:16px;border-width:2px;background:color-mix(in srgb,var(--surface) 88%,var(--warning-color) 12%)}.filesystem-warning strong{font-size:14px;color:var(--warning-color)}
+  .safety-banner{display:flex;align-items:flex-start;gap:10px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:var(--surface);color:var(--muted)}.safety-banner.safe{border-color:var(--success-border);color:var(--success-color)}.safety-banner.warning{border-color:var(--warning-border);color:var(--warning-color)}.safety-banner>div{display:grid;gap:3px}.safety-banner span,.safety-banner small{color:var(--muted);font-size:11px}
+  .filesystem-warning{padding:16px;border-width:2px;background:var(--warning-soft)}.filesystem-warning strong{font-size:14px;color:var(--warning-color)}
   .device-tabs{display:flex;gap:4px;overflow-x:auto;padding:4px;border-radius:11px;background:var(--surface-2)}.device-tabs button{min-height:36px;display:flex;align-items:center;gap:6px;padding:0 11px;border-radius:8px;background:transparent;color:var(--muted);text-transform:capitalize;white-space:nowrap}.device-tabs button.active{background:var(--surface);color:var(--accent);box-shadow:var(--shadow)}
   .overview-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.overview-grid article{min-height:130px;display:flex;align-items:flex-start;gap:12px;padding:17px;border:1px solid var(--line);border-radius:14px;background:var(--surface)}.overview-grid article>div{display:grid;gap:6px}.overview-grid span{color:var(--muted);font-size:11px}.capacity-card{grid-column:1/-1;display:grid!important}.capacity-card>div{display:flex!important;justify-content:space-between}.capacity-card progress{width:100%;height:8px;accent-color:var(--accent)}.next-step-card{grid-column:1/-1;min-height:0!important}.raw-path{font-family:var(--font-mono);overflow-wrap:anywhere}dl{width:100%;margin:0}dl>div{display:flex;justify-content:space-between;gap:14px;padding:6px 0;border-top:1px solid var(--line);font-size:11px}dt{color:var(--muted)}dd{margin:0;text-align:right;overflow:hidden;text-overflow:ellipsis}
   .browser-toolbar{display:flex;gap:8px}.browser-toolbar label,.local-search{height:38px;flex:1;display:flex;align-items:center;gap:7px;padding:0 10px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}.browser-toolbar input,.local-search input{width:100%;padding:0;border:0;background:transparent;box-shadow:none}
   .state{min-height:230px;display:grid;place-items:center;align-content:center;gap:8px;color:var(--muted);text-align:center}.state.error{color:var(--error-color)}.state span{font-size:11px}:global(.browse-list){border-radius:10px}:global(.browse-list) article{height:54px;display:grid;grid-template-columns:34px minmax(0,1fr);align-items:center;gap:10px;padding:7px 11px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}:global(.browse-list) article>span{color:var(--faint);font-size:10px;text-align:center}:global(.browse-list) article>div{min-width:0;display:grid;gap:3px}:global(.browse-list) strong,:global(.browse-list) small{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}:global(.browse-list) small{color:var(--muted);font-size:10px}.pager{display:flex;align-items:center;justify-content:center;gap:12px}.pager button{min-height:36px;display:flex;align-items:center;gap:5px;padding:0 10px;border-radius:8px;background:var(--surface-2);color:var(--text)}.pager span{color:var(--muted);font-size:10px}
-  .sync-layout{display:grid;grid-template-columns:minmax(280px,.78fr) minmax(380px,1.22fr);gap:14px}.local-picker,.plan-review{min-width:0;padding:17px;border:1px solid var(--line);border-radius:14px;background:var(--surface)}.local-picker header,.plan-review>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.local-picker h3,.plan-review h3{margin:3px 0 0}.local-picker header>span,.plan-review header small{color:var(--muted);font-size:10px}:global(.release-picker){margin:10px 0}:global(.release-picker) button{width:100%;height:53px;display:grid;grid-template-columns:30px minmax(0,1fr);align-items:center;gap:8px;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--bg);text-align:left}:global(.release-picker) button.selected{border-color:var(--accent);background:var(--accent-soft)}:global(.release-picker) button>span{width:28px;height:28px;display:grid;place-items:center;border-radius:8px;background:var(--surface-2);color:var(--accent)}:global(.release-picker) button>div{min-width:0;display:grid;gap:2px}:global(.release-picker) strong,:global(.release-picker) small{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}:global(.release-picker) small{color:var(--muted);font-size:10px}.plan-button{width:100%}.inline-error{padding:10px;border-radius:9px;background:color-mix(in srgb,var(--surface) 90%,var(--error-color) 10%);color:var(--error-color);font-size:11px}
+  .sync-layout{display:grid;grid-template-columns:minmax(280px,.78fr) minmax(380px,1.22fr);gap:14px}.local-picker,.plan-review{min-width:0;padding:17px;border:1px solid var(--line);border-radius:14px;background:var(--surface)}.local-picker header,.plan-review>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;margin-bottom:12px}.local-picker h3,.plan-review h3{margin:3px 0 0}.local-picker header>span,.plan-review header small{color:var(--muted);font-size:10px}:global(.release-picker){margin:10px 0}:global(.release-picker) button{width:100%;height:53px;display:grid;grid-template-columns:30px minmax(0,1fr);align-items:center;gap:8px;padding:8px;border:1px solid var(--line);border-radius:10px;background:var(--bg);text-align:left}:global(.release-picker) button.selected{border-color:var(--accent);background:var(--accent-soft)}:global(.release-picker) button>span{width:28px;height:28px;display:grid;place-items:center;border-radius:8px;background:var(--surface-2);color:var(--accent)}:global(.release-picker) button>div{min-width:0;display:grid;gap:2px}:global(.release-picker) strong,:global(.release-picker) small{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}:global(.release-picker) small{color:var(--muted);font-size:10px}.plan-button{width:100%}.inline-error{padding:10px;border-radius:9px;background:var(--error-soft);color:var(--error-color);font-size:11px}
   .plan-groups{display:grid;grid-template-columns:repeat(3,1fr);gap:7px}.plan-groups article{display:grid;gap:2px;padding:11px;border-radius:10px;background:var(--bg)}.plan-groups article.warning{color:var(--warning-color)}.plan-groups strong{font-size:19px}.plan-groups span{color:var(--muted);font-size:9px}.storage-review{margin:12px 0}.exact-confirm{display:flex;align-items:flex-start;gap:9px;margin:12px 0;color:var(--muted);font-size:11px;line-height:1.45}.exact-confirm input{margin-top:2px;accent-color:var(--accent)}.sync-actions{display:flex;gap:8px}
   button:focus-visible,input:focus-visible,.device-panel:focus-visible{outline:2px solid var(--focus-ring);outline-offset:2px}
   .device-panel{min-width:0}

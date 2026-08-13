@@ -166,7 +166,7 @@
   nav strong{font-size:10px}
   .detail-list{max-height:280px;overflow:auto;display:grid;gap:5px}
   article{display:grid;grid-template-columns:72px minmax(0,1fr);gap:9px;padding:9px;border:1px solid var(--line);border-radius:9px;background:var(--bg)}
-  article.attention{border-color:color-mix(in srgb,var(--warning-color,#ff9f0a) 32%,var(--line))}
+  article.attention{border-color:var(--warning-border)}
   article>div{min-width:0;display:grid;gap:2px}
   article strong,article small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   article small{color:var(--muted);font-size:9px}

@@ -263,7 +263,7 @@
 
 <style>
   audio { display: none; }
-  .player-bar { position:fixed;left:calc(var(--sidebar-width,240px) + 22px);right:22px;bottom:18px;min-height:76px;z-index:15;display:grid;grid-template-columns:minmax(180px,.8fr) minmax(300px,1.35fr) minmax(190px,.8fr);align-items:center;gap:18px;padding:9px 14px;border:1px solid var(--line);border-radius:16px;background:color-mix(in srgb,var(--surface) 94%,transparent);box-shadow:var(--shadow);backdrop-filter:blur(30px)}
+  .player-bar { position:fixed;left:calc(var(--sidebar-width,240px) + 22px);right:22px;bottom:18px;min-height:76px;z-index:15;display:grid;grid-template-columns:minmax(180px,.8fr) minmax(300px,1.35fr) minmax(190px,.8fr);align-items:center;gap:18px;padding:9px 14px;border:1px solid var(--line);border-radius:16px;background:var(--overlay-surface);box-shadow:var(--shadow);backdrop-filter:blur(30px)}
   .identity { min-width:0;display:flex;align-items:center;gap:10px; }
   .player-art { width:48px;height:48px;flex:0 0 48px;display:grid;place-items:center;overflow:hidden;border-radius:9px;background:var(--surface-2);color:var(--faint); }
   .identity-copy { min-width:0;display:grid;gap:2px; }

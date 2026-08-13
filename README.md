@@ -2,7 +2,7 @@
 
 Vela is a desktop application for browsing an Apple Music library and building an organised local music collection. It combines an Apple Music-inspired library interface, persistent local indexing, a resumable concurrent download queue, and local playback and iPod-management foundations.
 
-## Version 2.2.3
+## Version 2.3.0
 
 - Apple Music is the only connected-library service.
 - Apple Music credentials stay on the device and are sent only to Apple's authenticated endpoints.

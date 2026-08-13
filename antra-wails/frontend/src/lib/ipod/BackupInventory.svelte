@@ -496,7 +496,7 @@
       <h3>Backups</h3>
       <span>Archives remain available here when their iPod is disconnected.</span>
     </div>
-    <button class="primary" type="button" disabled={manualStarting || operationBusy || device.browse_only} on:click={createManualBackup}>
+    <button class="primary" type="button" title={!device.write_ready ? device.write_block_reason : undefined} disabled={manualStarting || operationBusy || !device.write_ready || device.filesystem_read_only} on:click={createManualBackup}>
       <Plus size={16} />
       {manualStarting ? 'Starting…' : 'Back up now'}
     </button>

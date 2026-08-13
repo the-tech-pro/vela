@@ -347,7 +347,7 @@
       <div class="inline-error"><AlertTriangle size={17} /><span>{error}</span></div>
     {/if}
 
-    <button class="preflight-button" type="button" disabled={preflighting || operationBusy || device.browse_only} on:click={runPreflight}>
+    <button class="preflight-button" type="button" title={!device.write_ready ? device.write_block_reason : undefined} disabled={preflighting || operationBusy || !device.write_ready || device.filesystem_read_only} on:click={runPreflight}>
       <ShieldCheck size={16} />
       {preflighting
         ? (mode === 'restore' ? 'Checking original device…' : 'Checking compatibility and staging…')

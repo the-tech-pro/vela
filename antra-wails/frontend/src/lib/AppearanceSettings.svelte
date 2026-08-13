@@ -2,6 +2,7 @@
   import { createEventDispatcher } from 'svelte';
   import { Check, RotateCcw } from 'lucide-svelte';
   import type { AppearancePreference, UIPreferences } from './uiPreferences';
+  import SelectField from './ui/SelectField.svelte';
 
   export let appearance: AppearancePreference;
   export let preferences: UIPreferences;
@@ -12,6 +13,16 @@
     reset: void;
   }>();
   const appearanceOptions: AppearancePreference[] = ['system', 'light', 'dark'];
+  const densityOptions = [
+    { value: 'compact', label: 'Compact' },
+    { value: 'comfortable', label: 'Comfortable' },
+    { value: 'spacious', label: 'Spacious' },
+  ];
+  const motionOptions = [
+    { value: 'system', label: 'System' },
+    { value: 'reduced', label: 'Reduced' },
+    { value: 'full', label: 'Full' },
+  ];
 
   function update<K extends keyof UIPreferences>(key: K, value: UIPreferences[K]) {
     dispatch('preferences', { ...preferences, [key]: value });
@@ -21,13 +32,18 @@
     dispatch('reset');
   }
 
-  function updateDensity(event: Event) {
-    update('density', (event.currentTarget as HTMLSelectElement).value as UIPreferences['density']);
+  function updateDensity(event: CustomEvent<string>) {
+    if (['compact', 'comfortable', 'spacious'].includes(event.detail)) {
+      update('density', event.detail as UIPreferences['density']);
+    }
   }
 
-  function updateMotion(event: Event) {
-    update('motion', (event.currentTarget as HTMLSelectElement).value as UIPreferences['motion']);
+  function updateMotion(event: CustomEvent<string>) {
+    if (['system', 'reduced', 'full'].includes(event.detail)) {
+      update('motion', event.detail as UIPreferences['motion']);
+    }
   }
+
 </script>
 
 <section class="appearance-page" id="settings-appearance">
@@ -71,11 +87,13 @@
 
   <div class="setting-row">
     <div><strong>Density</strong><span>Adjust spacing without hiding information.</span></div>
-    <select value={preferences.density} on:change={updateDensity}>
-      <option value="compact">Compact</option>
-      <option value="comfortable">Comfortable</option>
-      <option value="spacious">Spacious</option>
-    </select>
+    <SelectField
+      id="appearance-density"
+      ariaLabel="Interface density"
+      value={preferences.density}
+      options={densityOptions}
+      on:change={updateDensity}
+    />
   </div>
 
   <label class="range-row">
@@ -92,11 +110,13 @@
 
   <div class="setting-row">
     <div><strong>Motion</strong><span>Your operating system’s reduced-motion setting always takes priority.</span></div>
-    <select value={preferences.motion} on:change={updateMotion}>
-      <option value="system">System</option>
-      <option value="reduced">Reduced</option>
-      <option value="full">Full</option>
-    </select>
+    <SelectField
+      id="appearance-motion"
+      ariaLabel="Motion preference"
+      value={preferences.motion}
+      options={motionOptions}
+      on:change={updateMotion}
+    />
   </div>
 </section>
 
@@ -115,24 +135,23 @@
   .preview-title { width:38%;height:12px;display:block;margin-bottom:18px;border-radius:99px;background:var(--text);opacity:.8; }
   .preview-cards { display:flex;gap:12px;overflow:hidden; }
   .preview-cards article { flex:0 0 auto;display:grid;gap:6px;transition:width .16s ease; }
-  .preview-art { width:100%;aspect-ratio:1;display:block;border-radius:8px;background:linear-gradient(145deg,var(--accent),color-mix(in srgb,var(--accent) 35%,var(--surface-2))); }
+  .preview-art { width:100%;aspect-ratio:1;display:block;border-radius:8px;background:linear-gradient(145deg,var(--accent),var(--accent-preview-end)); }
   .preview-cards small { width:75%;height:6px;border-radius:99px;background:var(--muted);opacity:.55; }
   .setting-row,.range-row { min-height:64px;display:flex;align-items:center;justify-content:space-between;gap:24px;padding:12px 0;border-top:1px solid var(--line); }
   .setting-row>div,.range-row>span { display:grid;gap:4px; }
   .setting-row span,.range-row small { color:var(--muted);font-size:11px;font-weight:400; }
-  .setting-row select { min-width:170px; }
   .segmented { display:flex;gap:3px;padding:3px;border-radius:9px;background:var(--surface-2); }
   .segmented button { min-width:76px;min-height:34px;display:flex;align-items:center;justify-content:center;gap:4px;padding:0 9px;border:0;border-radius:7px;background:transparent;color:var(--muted);cursor:pointer; }
   .segmented button.active { background:var(--surface);color:var(--text);box-shadow:0 1px 4px rgba(0,0,0,.12); }
   .range-row { display:grid;grid-template-columns:minmax(0,1fr) 56px minmax(160px,240px);cursor:pointer; }
   .range-row output { color:var(--muted);font:11px ui-monospace,SFMono-Regular,Consolas,monospace;text-align:right; }
   .range-row input { width:100%;padding:0;border:0;background:transparent;box-shadow:none;accent-color:var(--accent); }
-  button:focus-visible,input:focus-visible,select:focus-visible { outline:2px solid var(--accent);outline-offset:2px; }
+  button:focus-visible,input:focus-visible { outline:2px solid var(--accent);outline-offset:2px; }
   @media(max-width:720px) {
     .range-row { grid-template-columns:1fr auto; }
     .range-row input { grid-column:1/-1; }
     .setting-row { align-items:flex-start;flex-direction:column;gap:10px; }
-    .setting-row select,.segmented { width:100%; }
+    .setting-row :global(.select-field),.segmented { width:100%; }
     .segmented button { flex:1;min-width:0; }
   }
 </style>
