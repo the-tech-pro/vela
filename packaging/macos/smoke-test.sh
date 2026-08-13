@@ -193,7 +193,7 @@ for _ in $(seq 1 120); do
     echo "Vela exited during startup." >&2
     exit 1
   fi
-  if [[ "$(osascript -e "application id \"$BUNDLE_ID\" is running" 2>/dev/null || true)" == "true" ]]; then
+  if [[ "$(lsappinfo find "bundleid=$BUNDLE_ID" 2>/dev/null || true)" == ASN:* ]]; then
     ready=1
     break
   fi
