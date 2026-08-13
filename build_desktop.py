@@ -252,7 +252,13 @@ def validate_macos_bundle_architectures(app_bundle: Path, target_arch: str) -> l
     """Validate every real Mach-O file in the assembled application bundle."""
     required = (
         app_bundle / "Contents" / "MacOS" / "Vela",
-        app_bundle / "Contents" / "Helpers" / "VelaBackend" / "VelaBackend",
+        app_bundle
+        / "Contents"
+        / "Helpers"
+        / "VelaBackend.app"
+        / "Contents"
+        / "MacOS"
+        / "VelaBackend",
     )
     for path in required:
         if not path.is_file():
@@ -406,6 +412,7 @@ def main():
     )
     os.environ["VELA_BUILD_MODE"] = build_mode
     os.environ["VELA_TARGET_ARCH"] = target_arch
+    os.environ["VELA_PRODUCT_VERSION"] = version
     os.environ["VELA_TOOLS_DIR"] = str(tools_dir)
     os.environ.setdefault("MACOSX_DEPLOYMENT_TARGET", "12.0")
 
@@ -430,8 +437,8 @@ def main():
     )
 
     if sys.platform == "darwin":
-        backend_output = BACKEND_DEST / "VelaBackend"
-        backend_exe = backend_output / "VelaBackend"
+        backend_output = BACKEND_DEST / "VelaBackend.app"
+        backend_exe = backend_output / "Contents" / "MacOS" / "VelaBackend"
     else:
         backend_output = BACKEND_DEST / executable_name("VelaBackend")
         backend_exe = backend_output
@@ -461,7 +468,7 @@ def main():
         final_artifact = WAILS_DIR / "build" / "bin" / "Vela.app"
         if not final_artifact.is_dir():
             raise SystemExit(f"[FAIL] Expected app bundle at {final_artifact}")
-        helper_dest = final_artifact / "Contents" / "Helpers" / "VelaBackend"
+        helper_dest = final_artifact / "Contents" / "Helpers" / "VelaBackend.app"
         shutil.rmtree(helper_dest, ignore_errors=True)
         helper_dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copytree(backend_output, helper_dest, symlinks=True)

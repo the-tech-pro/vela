@@ -22,7 +22,9 @@ func TestDarwinBundledBackendPath(t *testing.T) {
 		"Vela.app",
 		"Contents",
 		"Helpers",
-		"VelaBackend",
+		"VelaBackend.app",
+		"Contents",
+		"MacOS",
 		"VelaBackend",
 	)
 

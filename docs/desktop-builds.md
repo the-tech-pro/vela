@@ -96,9 +96,10 @@ export MACOSX_DEPLOYMENT_TARGET=12.0
 python3 build_desktop.py --build-mode release --target-arch arm64  # amd64 on Intel
 ```
 
-The result is `antra-wails/build/bin/Vela.app`. Its Python backend is an onedir
-helper at `Contents/Helpers/VelaBackend`; it is not extracted into a writable
-temporary directory at launch.
+The result is `antra-wails/build/bin/Vela.app`. Its Python backend is a nested
+PyInstaller bundle at `Contents/Helpers/VelaBackend.app`; its executable code,
+frameworks, and resources remain in their macOS-mandated bundle locations and
+are not extracted into a writable temporary directory at launch.
 
 An unsigned manual run of `.github/workflows/macos.yml` uses fresh
 GitHub-hosted native runners (`macos-14` for arm64 and `macos-15-intel` for

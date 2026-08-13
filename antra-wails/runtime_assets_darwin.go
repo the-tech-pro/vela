@@ -13,11 +13,17 @@ var bundledBackendMemo backendPathMemo
 
 func darwinBundledBackendPath(executable string) string {
 	return filepath.Clean(filepath.Join(
-		filepath.Dir(executable), "..", "Helpers", "VelaBackend", "VelaBackend",
+		filepath.Dir(executable),
+		"..",
+		"Helpers",
+		"VelaBackend.app",
+		"Contents",
+		"MacOS",
+		"VelaBackend",
 	))
 }
 
-// ensureBundledBackend resolves the signed PyInstaller onedir helper in-place.
+// ensureBundledBackend resolves the signed nested PyInstaller helper in-place.
 // macOS hardened runtime validation does not permit extracting executable code
 // from the signed application bundle into a writable directory.
 func ensureBundledBackend() (string, error) {

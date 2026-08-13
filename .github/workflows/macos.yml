@@ -139,7 +139,7 @@ jobs:
         shell: bash
         run: |
           test -x antra-wails/build/bin/Vela.app/Contents/MacOS/Vela
-          test -x antra-wails/build/bin/Vela.app/Contents/Helpers/VelaBackend/VelaBackend
+          test -x antra-wails/build/bin/Vela.app/Contents/Helpers/VelaBackend.app/Contents/MacOS/VelaBackend
           file antra-wails/build/bin/Vela.app/Contents/MacOS/Vela | grep -q "$(test '${{ matrix.arch }}' = arm64 && echo arm64 || echo x86_64)"
           /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' antra-wails/build/bin/Vela.app/Contents/Info.plist | grep -q '^12.0$'
 

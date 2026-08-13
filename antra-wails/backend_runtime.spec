@@ -1,9 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
 """Platform-aware PyInstaller build for Vela's Python backend.
 
-Windows/Linux use a one-file executable. macOS uses an onedir helper so signed
-code remains in Vela.app/Contents/Helpers and is never unpacked to a temporary
-directory at runtime. VELA_TOOLS_DIR must contain ffmpeg, ffprobe and fpcalc.
+Windows/Linux use a one-file executable. macOS uses a nested app-bundle helper
+so executable code, frameworks, and resources occupy valid signed locations
+and are never unpacked to a temporary directory at runtime. VELA_TOOLS_DIR
+must contain ffmpeg, ffprobe and fpcalc.
 """
 
 import os
@@ -184,6 +185,21 @@ if IS_DARWIN:
         name="VelaBackend",
         strip=False,
         upx=False,
+    )
+    backend_bundle_id = (
+        os.environ.get("VELA_BUNDLE_ID", "com.example.vela.development")
+        + ".backend"
+    )
+    app = BUNDLE(
+        coll,
+        name="VelaBackend.app",
+        version=os.environ.get("VELA_PRODUCT_VERSION", "0.0.0"),
+        bundle_identifier=backend_bundle_id,
+        info_plist={
+            "CFBundleDisplayName": "VelaBackend",
+            "LSBackgroundOnly": True,
+            "LSMinimumSystemVersion": "12.0",
+        },
     )
 else:
     exe = EXE(

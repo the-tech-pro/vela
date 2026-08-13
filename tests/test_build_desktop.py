@@ -224,7 +224,15 @@ class MachOValidationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             app = Path(temp_dir) / "Vela.app"
             main = app / "Contents" / "MacOS" / "Vela"
-            helper = app / "Contents" / "Helpers" / "VelaBackend" / "VelaBackend"
+            helper = (
+                app
+                / "Contents"
+                / "Helpers"
+                / "VelaBackend.app"
+                / "Contents"
+                / "MacOS"
+                / "VelaBackend"
+            )
             framework = app / "Contents" / "Frameworks" / "libfixture.dylib"
             resource = app / "Contents" / "Resources" / "fixture.txt"
             for path in (main, helper, framework, resource):

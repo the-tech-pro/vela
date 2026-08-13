@@ -56,8 +56,9 @@ esac
 }
 
 MAIN="$APP/Contents/MacOS/Vela"
-BACKEND="$APP/Contents/Helpers/VelaBackend/VelaBackend"
-FPCALC="$APP/Contents/Helpers/VelaBackend/_internal/tools/fpcalc"
+BACKEND_APP="$APP/Contents/Helpers/VelaBackend.app"
+BACKEND="$BACKEND_APP/Contents/MacOS/VelaBackend"
+FPCALC="$BACKEND_APP/Contents/Frameworks/_internal/tools/fpcalc"
 INFO_PLIST="$APP/Contents/Info.plist"
 for required in "$MAIN" "$BACKEND" "$FPCALC" "$INFO_PLIST"; do
   [[ -e "$required" ]] || {
@@ -199,7 +200,7 @@ done
   echo "Vela did not complete a clean application quit." >&2
   exit 1
 }
-if pgrep -f "$APP/Contents/Helpers/VelaBackend/VelaBackend" >/dev/null 2>&1; then
+if pgrep -f "$BACKEND_APP/Contents/MacOS/VelaBackend" >/dev/null 2>&1; then
   echo "A VelaBackend process survived application shutdown." >&2
   exit 1
 fi
