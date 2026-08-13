@@ -213,10 +213,10 @@ Each `macOS-12,vela-smoke` job first checks the actual OS major version and CPU,
 validates the stapled DMG with Gatekeeper, mounts it read-only, copies
 `Vela.app` to a fresh temporary install directory, and assesses the copied app.
 It then runs `packaging/macos/smoke-test.sh`. That repository-owned baseline
-checks native app/helper slices, packaged-helper CLI IPC, bundled media-tool
-resolution and decoding/probing of a generated audio fixture, read-only mounted
-iPod discovery, application process startup, clean quit, and orphan cleanup. A
-lane can set `VELA_SMOKE_REQUIRE_IPOD=1` when a
+checks native app/helper slices, one-shot and long-lived correlated backend IPC,
+bundled media-tool resolution and decoding/probing of a generated audio fixture,
+read-only mounted-iPod discovery, frontend DOM readiness, clean quit, and orphan
+cleanup. A lane can set `VELA_SMOKE_REQUIRE_IPOD=1` when a
 mounted fixture device is mandatory.
 
 The job then requires the executable named by

@@ -2,7 +2,7 @@
 
 Vela is a desktop application for browsing an Apple Music library and building an organised local music collection. It combines an Apple Music-inspired library interface, persistent local indexing, a resumable concurrent download queue, and local playback and iPod-management foundations.
 
-## Version 2.2.2
+## Version 2.2.3
 
 - Apple Music is the only connected-library service.
 - Apple Music credentials stay on the device and are sent only to Apple's authenticated endpoints.
@@ -11,6 +11,7 @@ Vela is a desktop application for browsing an Apple Music library and building a
 - Downloads are grouped into resumable jobs with configurable concurrency, pause, cancel, progress, and history controls.
 - Output supports FLAC, ALAC, AAC, and MP3, using the retained non-P2P downloader sources.
 - All product features are available in the paid build; there is no supporter key or feature-gated tier.
+- Native Apple Silicon and Intel macOS development DMGs build and pass the repository packaging/runtime baseline; public distribution still requires Developer ID signing, notarization, macOS 12 qualification, and supervised iPod testing.
 - iPod management now includes offline backup inventory/verification/export, journaled same-device full file restore, reviewed compatible replacement-device migration, and durable interrupted-operation recovery. Windows also reports attached Mac-formatted HFS+ iPods through bounded raw read-only metadata inspection instead of silently omitting them; filesystem-dependent actions remain blocked until a trusted HFS+ layer is available. The Advanced Windows Classic 6G/6.5G capacity unlock remains Experimental and requires manual Rockbox, NOR, DFU, and iTunes steps plus supervised hardware validation.
 - Appearance and general preferences have a versioned configuration schema with bounded scale, density, sidebar/artwork sizing, motion, player volume, startup, notification, and history-retention settings. The corresponding Settings/player UI is completed separately in the desktop frontend.
 
