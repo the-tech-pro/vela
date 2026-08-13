@@ -102,6 +102,10 @@ sign_nested_code() {
     --entitlements "$BACKEND_ENTITLEMENTS" --sign "$IDENTITY" "$1"
 }
 
+# This package marker is not used at runtime. PyInstaller's imageio hook can
+# mark it as nested executable content, which invalidates the enclosing app.
+rm -f "$APP/Contents/Helpers/VelaBackend/_internal/imageio_ffmpeg/binaries/README.md"
+
 # Sign every nested Mach-O leaf throughout the app, not only the helper.
 # The root app executable is deliberately deferred until all nested code.
 while IFS= read -r -d '' item; do

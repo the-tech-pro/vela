@@ -142,6 +142,15 @@ a = Analysis(
     noarchive=False,
     optimize=1,  # compile .pyc with basic optimisations (strips docstrings)
 )
+# The built-in imageio-ffmpeg hook can add this file again during Analysis,
+# after the explicit data list above has been filtered.
+a.datas = [
+    item
+    for item in a.datas
+    if not item[0].replace("\\", "/").lower().endswith(
+        "imageio_ffmpeg/binaries/readme.md"
+    )
+]
 
 pyz = PYZ(a.pure)
 

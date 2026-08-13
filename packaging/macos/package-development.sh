@@ -30,6 +30,10 @@ is_macho() {
   file -b "$1" | grep -q "Mach-O"
 }
 
+# This package marker is not used at runtime. PyInstaller's imageio hook can
+# mark it as nested executable content, which invalidates the enclosing app.
+rm -f "$APP/Contents/Helpers/VelaBackend/_internal/imageio_ffmpeg/binaries/README.md"
+
 # Ad-hoc signing does not establish distributable trust. It makes the
 # development app internally coherent so native CI can launch and test it.
 while IFS= read -r -d '' item; do
