@@ -107,7 +107,15 @@ func TestResolveLibraryPathAllowsContainedFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if filepath.Clean(got) != filepath.Clean(track) {
-		t.Fatalf("resolved %q, want %q", got, track)
+	gotInfo, err := os.Stat(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	trackInfo, err := os.Stat(track)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(gotInfo, trackInfo) {
+		t.Fatalf("resolved %q, want the file %q", got, track)
 	}
 }

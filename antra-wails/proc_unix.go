@@ -46,7 +46,13 @@ func killCommandTree(cmd *exec.Cmd) error {
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) && !errors.Is(err, os.ErrProcessDone) {
+	// macOS can report EPERM for the final group signal while terminated
+	// children are waiting to be reaped. The caller's Cmd.Wait remains the
+	// authoritative completion check after the successful SIGTERM above.
+	if err := syscall.Kill(-pgid, syscall.SIGKILL); err != nil &&
+		!errors.Is(err, syscall.ESRCH) &&
+		!errors.Is(err, syscall.EPERM) &&
+		!errors.Is(err, os.ErrProcessDone) {
 		return err
 	}
 	return nil

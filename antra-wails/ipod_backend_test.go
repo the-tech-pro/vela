@@ -64,8 +64,19 @@ func TestValidatedCompletedLibraryFilesRejectsMissingAndOutside(t *testing.T) {
 		[]string{inside, filepath.Join(root, "missing.flac"), outside, inside},
 		root,
 	)
-	if len(got) != 1 || got[0] != inside {
+	if len(got) != 1 {
 		t.Fatalf("unexpected validated paths: %#v", got)
+	}
+	gotInfo, err := os.Stat(got[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	insideInfo, err := os.Stat(inside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(gotInfo, insideInfo) {
+		t.Fatalf("validated %q, want the file %q", got[0], inside)
 	}
 }
 
