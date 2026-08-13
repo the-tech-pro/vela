@@ -150,6 +150,68 @@ PY
 # shellcheck disable=SC1090
 source "$TOOLS_ENV"
 
+python3 - "$BACKEND" "$TEMP_DIR/home" "$APP" "$REQUIRE_IPOD" <<'PY'
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+backend, home, app_raw, require_ipod = sys.argv[1:]
+app = Path(app_raw).resolve()
+environment = os.environ.copy()
+for name in (
+    "VELA_TOOLS_DIR",
+    "VELA_TOOLS_CHECKSUMS",
+    "VELA_RELEASE_OWNER_METADATA",
+):
+    environment.pop(name, None)
+environment["HOME"] = home
+
+requests = (
+    {"protocol_version": 1, "id": "media", "command": "ffmpeg_paths", "params": {}},
+    {"protocol_version": 1, "id": "ipod", "command": "ipod_scan", "params": {}},
+)
+completed = subprocess.run(
+    [backend, "--read-only-helper"],
+    input="".join(json.dumps(request) + "\n" for request in requests),
+    text=True,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.PIPE,
+    env=environment,
+    timeout=60,
+    check=False,
+)
+if completed.returncode != 0:
+    raise SystemExit(
+        f"read-only helper exited with status {completed.returncode}"
+    )
+lines = completed.stdout.splitlines()
+if len(lines) != len(requests):
+    raise SystemExit(
+        f"read-only helper returned {len(lines)} responses; expected {len(requests)}"
+    )
+responses = [json.loads(line) for line in lines]
+for expected_id, response in zip(("media", "ipod"), responses, strict=True):
+    if response.get("id") != expected_id or response.get("ok") is not True:
+        raise SystemExit(f"read-only helper failed request {expected_id}")
+
+media = responses[0].get("result")
+if not isinstance(media, dict):
+    raise SystemExit("read-only helper returned invalid media-tool data")
+for name in ("ffmpeg", "ffprobe"):
+    tool = Path(str(media.get(name) or "")).resolve()
+    if not tool.is_file() or not os.access(tool, os.X_OK) or app not in tool.parents:
+        raise SystemExit(f"read-only helper returned an unusable bundled {name}")
+
+scan = responses[1].get("result")
+devices = scan.get("devices") if isinstance(scan, dict) else None
+if not isinstance(devices, list):
+    raise SystemExit("read-only helper iPod scan did not return a device array")
+if require_ipod == "1" and not devices:
+    raise SystemExit("read-only helper did not find the required mounted fixture iPod")
+PY
+
 python3 - "$TEMP_DIR/fixture.wav" <<'PY'
 import math
 import struct
